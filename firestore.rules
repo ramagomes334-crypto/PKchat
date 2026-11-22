@@ -292,6 +292,28 @@ service cloud.firestore {
         data.createdAt is timestamp;
     }
 
+    function isValidTypingStatus(data) {
+      return data.keys().hasAll(['convId', 'uid', 'displayName', 'isTyping', 'updatedAt']) &&
+        data.keys().hasOnly(['convId', 'uid', 'displayName', 'isTyping', 'updatedAt']) &&
+        data.convId is string && data.convId.size() >= 1 && data.convId.size() <= 128 &&
+        data.uid is string && data.uid == request.auth.uid &&
+        data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 80 &&
+        data.isTyping is bool &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidCallSignal(data) {
+      return data.keys().hasAll(['id', 'callId', 'senderUid', 'targetUid', 'type', 'payload', 'createdAt']) &&
+        data.keys().hasOnly(['id', 'callId', 'senderUid', 'targetUid', 'type', 'payload', 'createdAt']) &&
+        data.id is string && data.id.size() >= 1 && data.id.size() <= 128 &&
+        data.callId is string && data.callId.size() >= 1 && data.callId.size() <= 128 &&
+        data.senderUid is string && data.senderUid == request.auth.uid &&
+        data.targetUid is string && data.targetUid.size() >= 1 && data.targetUid.size() <= 128 &&
+        data.type in ['offer', 'answer', 'ice-candidate'] &&
+        data.payload is string && data.payload.size() >= 2 && data.payload.size() <= 16000 &&
+        data.createdAt is timestamp;
+    }
+
     // --- Collection Rules ---
 
     // 1. Public User Profiles (PII-free)
@@ -528,6 +550,28 @@ service cloud.firestore {
         allow delete: if isVerifiedUser() && isValidId(convId) && isValidId(msgId) &&
           (existing().senderUid == request.auth.uid || isConvAdmin(convId));
       }
+
+      // Live typing indicators
+      match /typing/{typingUid} {
+        allow get: if isSignedIn() && isValidId(convId) && isValidId(typingUid) && isConvMember(convId);
+        allow list: if isSignedIn() && isConvMember(convId) && resource.data.convId == convId;
+        allow create: if isVerifiedUser() && isValidId(convId) && isValidId(typingUid) &&
+          typingUid == request.auth.uid &&
+          isConvMember(convId) &&
+          isValidTypingStatus(incoming()) &&
+          incoming().convId == convId &&
+          incoming().updatedAt == request.time;
+        allow update: if isVerifiedUser() && isValidId(convId) && isValidId(typingUid) &&
+          typingUid == request.auth.uid &&
+          isConvMember(convId) &&
+          isValidTypingStatus(incoming()) &&
+          incoming().convId == existing().convId &&
+          incoming().uid == existing().uid &&
+          incoming().updatedAt == request.time &&
+          incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'isTyping', 'updatedAt']);
+        allow delete: if isVerifiedUser() && isValidId(convId) && isValidId(typingUid) &&
+          typingUid == request.auth.uid;
+      }
     }
 
     // 5. Statuses & Views
@@ -597,6 +641,23 @@ service cloud.firestore {
         incoming().startedAt == existing().startedAt &&
         incoming().diff(existing()).affectedKeys().hasOnly(['status', 'durationSeconds', 'endedAt']);
       allow delete: if isVerifiedUser() && isValidId(callId) && request.auth.uid in existing().participantUids;
+
+      match /signals/{signalId} {
+        allow get: if isSignedIn() && isValidId(callId) && isValidId(signalId) &&
+          (resource == null || resource.data.senderUid == request.auth.uid || resource.data.targetUid == request.auth.uid);
+        allow list: if isSignedIn() &&
+          (resource.data.senderUid == request.auth.uid || resource.data.targetUid == request.auth.uid);
+        allow create: if isVerifiedUser() && isValidId(callId) && isValidId(signalId) &&
+          isValidCallSignal(incoming()) &&
+          incoming().id == signalId &&
+          incoming().callId == callId &&
+          exists(/databases/$(database)/documents/calls/$(callId)) &&
+          request.auth.uid in get(/databases/$(database)/documents/calls/$(callId)).data.participantUids &&
+          incoming().targetUid in get(/databases/$(database)/documents/calls/$(callId)).data.participantUids &&
+          incoming().createdAt == request.time;
+        allow delete: if isVerifiedUser() && isValidId(callId) && isValidId(signalId) &&
+          (existing().senderUid == request.auth.uid || existing().targetUid == request.auth.uid);
+      }
     }
 
     // 7. User Reports

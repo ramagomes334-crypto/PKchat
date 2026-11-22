@@ -67,14 +67,95 @@ export function getDeviceInfo(): { deviceId: string; deviceName: string; platfor
   return { deviceId: getDeviceId(), deviceName, platform };
 }
 
+const CLOUDINARY_STORAGE_KEY = 'pk_chat_cloudinary_cfg';
+
+export function getCloudinaryConfig(): { cloudName: string; uploadPreset: string; fromEnv: boolean } {
+  const envCloud = ((import.meta as any).env?.VITE_CLOUDINARY_CLOUD_NAME || '').trim();
+  const envPreset = ((import.meta as any).env?.VITE_CLOUDINARY_UPLOAD_PRESET || '').trim();
+  if (envCloud && envPreset) {
+    return { cloudName: envCloud, uploadPreset: envPreset, fromEnv: true };
+  }
+  try {
+    const raw = localStorage.getItem(CLOUDINARY_STORAGE_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (parsed?.cloudName && parsed?.uploadPreset) {
+        return {
+          cloudName: String(parsed.cloudName).trim(),
+          uploadPreset: String(parsed.uploadPreset).trim(),
+          fromEnv: false,
+        };
+      }
+    }
+  } catch {
+    // Ignore storage read errors
+  }
+  return { cloudName: '', uploadPreset: '', fromEnv: false };
+}
+
+export function saveCloudinaryConfig(cloudName: string, uploadPreset: string) {
+  const c = cloudName.trim();
+  const p = uploadPreset.trim();
+  if (!c || !p) {
+    localStorage.removeItem(CLOUDINARY_STORAGE_KEY);
+    return;
+  }
+  localStorage.setItem(CLOUDINARY_STORAGE_KEY, JSON.stringify({ cloudName: c, uploadPreset: p }));
+}
+
+export async function hashPasswordClient(password: string): Promise<string> {
+  const enc = new TextEncoder();
+  const saltBytes = crypto.getRandomValues(new Uint8Array(16));
+  const saltHex = Array.from(saltBytes, (b) => b.toString(16).padStart(2, '0')).join('');
+  const keyMaterial = await crypto.subtle.importKey('raw', enc.encode(password), 'PBKDF2', false, ['deriveBits']);
+  const bits = await crypto.subtle.deriveBits(
+    { name: 'PBKDF2', salt: saltBytes, iterations: 100000, hash: 'SHA-256' },
+    keyMaterial,
+    256
+  );
+  const hashHex = Array.from(new Uint8Array(bits), (b) => b.toString(16).padStart(2, '0')).join('');
+  return `pbkdf2:${saltHex}:${hashHex}`;
+}
+
 export async function uploadMediaFile(
   file: File | Blob,
   customName?: string
 ): Promise<{ url: string; name: string; mimeType: string; size: number }> {
   const user = auth.currentUser;
   if (!user) throw new Error('Anda harus masuk untuk mengunggah media');
-  const token = await user.getIdToken();
 
+  const filename = customName || (file instanceof File ? file.name : 'media.webm');
+  const mimeType = file.type || 'application/octet-stream';
+
+  if (file.size > 18 * 1024 * 1024) {
+    throw new Error('Ukuran file maksimal 18 MB');
+  }
+
+  // 1. Direct browser upload to free Cloudinary unsigned preset (works 100% on Netlify Free)
+  const cloudCfg = getCloudinaryConfig();
+  if (cloudCfg.cloudName && cloudCfg.uploadPreset) {
+    const form = new FormData();
+    form.append('file', file, filename);
+    form.append('upload_preset', cloudCfg.uploadPreset);
+    const cloudRes = await fetch(
+      `https://api.cloudinary.com/v1_1/${encodeURIComponent(cloudCfg.cloudName)}/auto/upload`,
+      { method: 'POST', body: form }
+    );
+    const cloudData = await cloudRes.json();
+    if (!cloudRes.ok || !cloudData.secure_url) {
+      throw new Error(cloudData?.error?.message || 'Gagal mengunggah media ke Cloudinary');
+    }
+    return {
+      url: cloudData.secure_url,
+      name: filename,
+      mimeType,
+      size: file.size,
+    };
+  }
+
+  // 2. Fallback to Express upload endpoint if running on Node/AI Studio or VITE_UPLOAD_API_URL
+  const token = await user.getIdToken();
+  const baseUrl = (((import.meta as any).env?.VITE_UPLOAD_API_URL as string) || '').replace(/\/$/, '');
   const dataBase64 = await new Promise<string>((resolve, reject) => {
     const reader = new FileReader();
     reader.onload = () => resolve(String(reader.result));
@@ -82,10 +163,7 @@ export async function uploadMediaFile(
     reader.readAsDataURL(file);
   });
 
-  const filename = customName || (file instanceof File ? file.name : 'media.webm');
-  const mimeType = file.type || 'application/octet-stream';
-
-  const res = await fetch('/api/upload', {
+  const res = await fetch(`${baseUrl}/api/upload`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -93,6 +171,13 @@ export async function uploadMediaFile(
     },
     body: JSON.stringify({ filename, mimeType, dataBase64 }),
   });
+
+  const contentType = res.headers.get('content-type') || '';
+  if (!contentType.includes('application/json')) {
+    throw new Error(
+      'Upload file di Netlify butuh Cloudinary gratis. Isi Cloud Name & Upload Preset di Pengaturan → Penyimpanan Media.'
+    );
+  }
 
   const data = await res.json();
   if (!res.ok) {
@@ -831,6 +916,50 @@ export async function updateCallDoc(
     });
   } catch {
     // Call doc might already be in terminal state
+  }
+}
+
+export async function sendCallSignal(params: {
+  callId: string;
+  senderUid: string;
+  targetUid: string;
+  type: 'offer' | 'answer' | 'ice-candidate';
+  payload: unknown;
+}) {
+  const signalId = `sig_${crypto.randomUUID().replace(/-/g, '').slice(0, 16)}`;
+  try {
+    const serialized = JSON.stringify(params.payload);
+    if (serialized.length > 15900) return;
+    await setDoc(doc(db, 'calls', params.callId, 'signals', signalId), {
+      id: signalId,
+      callId: params.callId,
+      senderUid: params.senderUid,
+      targetUid: params.targetUid,
+      type: params.type,
+      payload: serialized,
+      createdAt: serverTimestamp(),
+    });
+  } catch {
+    // Non-blocking signaling packet
+  }
+}
+
+export async function setTypingStatus(
+  convId: string,
+  uid: string,
+  displayName: string,
+  isTyping: boolean
+) {
+  try {
+    await setDoc(doc(db, 'conversations', convId, 'typing', uid), {
+      convId,
+      uid,
+      displayName: (displayName || 'Pengguna').slice(0, 80),
+      isTyping,
+      updatedAt: serverTimestamp(),
+    });
+  } catch {
+    // Non-blocking typing indicator
   }
 }
 

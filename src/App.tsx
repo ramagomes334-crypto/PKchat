@@ -135,10 +135,23 @@ function PKChatApp() {
   const [notifications, setNotifications] = useState<NotificationItem[]>([]);
   const [activeConvMessages, setActiveConvMessages] = useState<Message[]>([]);
 
-  // Real-time WebSocket state
-  const [onlineUsers, setOnlineUsers] = useState<Record<string, boolean>>({});
+  // Real-time presence, typing & call state
   const [typingMap, setTypingMap] = useState<Record<string, Record<string, string>>>({});
   const [activeCall, setActiveCall] = useState<ActiveCallSession | null>(null);
+  const handledIncomingCallsRef = React.useRef<Set<string>>(new Set());
+
+  const onlineUsers = useMemo(() => {
+    const now = Date.now();
+    const map: Record<string, boolean> = {};
+    Object.values(profilesCache).forEach((p) => {
+      const lastSeenMs = (p.lastSeen as any)?.toMillis?.() ?? 0;
+      const fresh = lastSeenMs === 0 || now - lastSeenMs < 180000;
+      if (p.isOnline && fresh) {
+        map[p.uid] = true;
+      }
+    });
+    return map;
+  }, [profilesCache]);
 
   // Theme application
   const applyTheme = (mode: 'light' | 'dark' | 'system') => {
@@ -196,7 +209,7 @@ function PKChatApp() {
     return () => unsub();
   }, []);
 
-  // Connect WebSocket once authenticated & onboarded
+  // Presence heartbeat & optional external WebSocket sync
   useEffect(() => {
     if (!firebaseUser || needsOnboarding) return;
     let active = true;
@@ -204,57 +217,38 @@ function PKChatApp() {
       if (active) wsClient.connect(token);
     });
 
-    const unsubWS = wsClient.subscribe((msg) => {
-      if (msg.type === 'auth:ok' && Array.isArray(msg.onlineUsers)) {
-        const map: Record<string, boolean> = {};
-        msg.onlineUsers.forEach((u: string) => (map[u] = true));
-        setOnlineUsers(map);
-      } else if (msg.type === 'presence' && msg.uid) {
-        setOnlineUsers((prev) => ({ ...prev, [msg.uid]: Boolean(msg.online) }));
-      } else if (msg.type === 'typing' && msg.convId && msg.uid) {
-        setTypingMap((prev) => {
-          const convTyping = { ...(prev[msg.convId] || {}) };
-          if (msg.isTyping) {
-            convTyping[msg.uid] = msg.displayName || 'Seseorang';
-          } else {
-            delete convTyping[msg.uid];
-          }
-          return { ...prev, [msg.convId]: convTyping };
-        });
-      } else if (msg.type === 'call:invite' && msg.callId) {
-        if (settings.notifyCalls) {
-          sendBrowserNotification(
-            'Panggilan Masuk · PK Chat',
-            `${msg.callerName || 'Seseorang'} mengundang Anda ke panggilan ${msg.callType === 'video' ? 'video' : 'suara'}`,
-            msg.callId
-          );
-        }
-        setActiveCall({
-          callId: msg.callId,
-          direction: 'incoming',
-          callType: msg.callType || 'audio',
-          peerUid: msg.fromUid,
-          peerName: msg.callerName || 'Panggilan Masuk',
-          peerPhoto: msg.callerPhoto,
-          status: 'ringing',
-        });
-      }
-    });
-
-    const handleBeforeUnload = () => {
-      if (auth.currentUser) {
-        updateDoc(doc(db, 'users', auth.currentUser.uid), {
-          isOnline: false,
-          lastSeen: serverTimestamp(),
-          updatedAt: serverTimestamp(),
-        }).catch(() => {});
-      }
+    const markPresence = (online: boolean) => {
+      if (!auth.currentUser) return;
+      updateDoc(doc(db, 'users', auth.currentUser.uid), {
+        isOnline: online,
+        lastSeen: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      }).catch(() => {});
     };
+
+    markPresence(true);
+    const heartbeat = window.setInterval(() => {
+      if (document.visibilityState === 'visible') {
+        markPresence(true);
+      }
+    }, 45000);
+
+    const handleVisibility = () => {
+      markPresence(document.visibilityState === 'visible');
+    };
+    const handleBeforeUnload = () => {
+      markPresence(false);
+    };
+
+    document.addEventListener('visibilitychange', handleVisibility);
+    window.addEventListener('pagehide', handleBeforeUnload);
     window.addEventListener('beforeunload', handleBeforeUnload);
 
     return () => {
       active = false;
-      unsubWS();
+      clearInterval(heartbeat);
+      document.removeEventListener('visibilitychange', handleVisibility);
+      window.removeEventListener('pagehide', handleBeforeUnload);
       window.removeEventListener('beforeunload', handleBeforeUnload);
     };
   }, [firebaseUser?.uid, needsOnboarding]);
@@ -329,6 +323,38 @@ function PKChatApp() {
           .map((d) => d.data() as CallRecord)
           .sort((a, b) => (b.startedAt?.toMillis?.() ?? 0) - (a.startedAt?.toMillis?.() ?? 0));
         setCalls(list);
+
+        const now = Date.now();
+        const incoming = list.find((c) => {
+          if (c.status !== 'ringing' || c.calleeUid !== uid) return false;
+          if (handledIncomingCallsRef.current.has(c.id)) return false;
+          const startedMs = (c.startedAt as any)?.toMillis?.() ?? now;
+          return now - startedMs < 60000;
+        });
+
+        if (incoming) {
+          handledIncomingCallsRef.current.add(incoming.id);
+          if (settings.notifyCalls) {
+            sendBrowserNotification(
+              'Panggilan Masuk · PK Chat',
+              `${incoming.callerName || 'Seseorang'} mengundang Anda ke panggilan ${incoming.type === 'video' ? 'video' : 'suara'}`,
+              incoming.id
+            );
+          }
+          setActiveCall((curr) =>
+            curr
+              ? curr
+              : {
+                  callId: incoming.id,
+                  direction: 'incoming',
+                  callType: incoming.type,
+                  peerUid: incoming.callerUid,
+                  peerName: incoming.callerName || 'Panggilan Masuk',
+                  peerPhoto: incoming.callerPhoto,
+                  status: 'ringing',
+                }
+          );
+        }
       },
       (err) => handleFirestoreError(err, OperationType.LIST, 'calls')
     );
@@ -421,14 +447,15 @@ function PKChatApp() {
     return () => unsubs.forEach((u) => u());
   }, [conversations, firebaseUser?.uid]);
 
-  // Listen to active conversation messages for info drawer media/starred list
+  // Listen to active conversation messages, typing indicators & peer online profile
   useEffect(() => {
-    const isMemberConv = activeConvId && conversations.some((c) => c.id === activeConvId);
-    if (!isMemberConv) {
+    const activeConvObj = conversations.find((c) => c.id === activeConvId);
+    if (!activeConvId || !activeConvObj || !firebaseUser) {
       setActiveConvMessages([]);
       return;
     }
-    const unsub = onSnapshot(
+
+    const unsubMsgs = onSnapshot(
       query(collection(db, 'conversations', activeConvId, 'messages'), where('convId', '==', activeConvId)),
       (snap) => {
         const list = snap.docs
@@ -438,8 +465,51 @@ function PKChatApp() {
       },
       (err) => handleFirestoreError(err, OperationType.LIST, `conversations/${activeConvId}/messages`)
     );
-    return () => unsub();
-  }, [activeConvId, conversations]);
+
+    const unsubTyping = onSnapshot(
+      query(collection(db, 'conversations', activeConvId, 'typing'), where('convId', '==', activeConvId)),
+      (snap) => {
+        const now = Date.now();
+        const convTyping: Record<string, string> = {};
+        snap.docs.forEach((d) => {
+          const t = d.data() as {
+            uid: string;
+            displayName: string;
+            isTyping: boolean;
+            updatedAt?: { toMillis?: () => number };
+          };
+          const updatedMs = t.updatedAt?.toMillis?.() ?? now;
+          if (t.isTyping && t.uid !== firebaseUser.uid && now - updatedMs < 10000) {
+            convTyping[t.uid] = t.displayName || 'Seseorang';
+          }
+        });
+        setTypingMap((prev) => ({ ...prev, [activeConvId]: convTyping }));
+      },
+      () => {}
+    );
+
+    let unsubPeer: (() => void) | undefined;
+    if (activeConvObj.type === 'private') {
+      const peerUid = activeConvObj.memberUids.find((u) => u !== firebaseUser.uid);
+      if (peerUid) {
+        unsubPeer = onSnapshot(
+          doc(db, 'users', peerUid),
+          (snap) => {
+            if (snap.exists()) {
+              setProfilesCache((prev) => ({ ...prev, [peerUid]: snap.data() as UserProfile }));
+            }
+          },
+          () => {}
+        );
+      }
+    }
+
+    return () => {
+      unsubMsgs();
+      unsubTyping();
+      if (unsubPeer) unsubPeer();
+    };
+  }, [activeConvId, conversations, firebaseUser?.uid]);
 
   // Deep linking support (`/?chat=...` or `/?u=...`)
   useEffect(() => {
@@ -550,14 +620,6 @@ function PKChatApp() {
           showProfilePhoto: true,
         },
         type,
-      });
-      wsClient.send({
-        type: 'call:invite',
-        targetUid: peerUid,
-        callId,
-        callType: type,
-        callerName: myProfile.displayName,
-        callerPhoto: myProfile.photoURL || '',
       });
       setActiveCall({
         callId,

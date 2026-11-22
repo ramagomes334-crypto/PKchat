@@ -38,8 +38,10 @@ import { auth, db, handleFirestoreError, OperationType } from '../lib/firebase';
 import {
   checkUsernameAvailable,
   deleteAccountData,
+  getCloudinaryConfig,
   normalizePhoneKey,
   sanitizeUsername,
+  saveCloudinaryConfig,
   uploadMediaFile,
 } from '../lib/chatService';
 import type {
@@ -85,6 +87,10 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const [oldPwd, setOldPwd] = useState('');
   const [newPwd, setNewPwd] = useState('');
   const [changingPwd, setChangingPwd] = useState(false);
+  const initialCloudCfg = getCloudinaryConfig();
+  const [cloudName, setCloudName] = useState(initialCloudCfg.cloudName);
+  const [uploadPreset, setUploadPreset] = useState(initialCloudCfg.uploadPreset);
+  const cloudFromEnv = initialCloudCfg.fromEnv;
 
   useEffect(() => {
     getDoc(doc(db, 'users', myProfile.uid, 'private', 'info')).then((snap) => {
@@ -790,6 +796,54 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             >
               Bersihkan Cache
             </button>
+          </div>
+
+          <div className="p-4 rounded-2xl border border-slate-200 dark:border-slate-800 space-y-2.5">
+            <div>
+              <div className="text-sm font-semibold text-slate-900 dark:text-white">
+                Penyimpanan Media Gratis (Cloudinary untuk Netlify)
+              </div>
+              <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
+                {cloudFromEnv
+                  ? 'Aktif otomatis melalui environment variable Netlify/hosting.'
+                  : 'Opsional untuk upload foto, video, & voice note di hosting statis gratis seperti Netlify (buat Unsigned Upload Preset gratis di Cloudinary).'}
+              </p>
+            </div>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+              <input
+                type="text"
+                disabled={cloudFromEnv}
+                value={cloudName}
+                onChange={(e) => setCloudName(e.target.value)}
+                placeholder="Cloud Name (contoh: dxyz123)"
+                className="px-3 py-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 text-xs text-slate-900 dark:text-white disabled:opacity-60"
+              />
+              <input
+                type="text"
+                disabled={cloudFromEnv}
+                value={uploadPreset}
+                onChange={(e) => setUploadPreset(e.target.value)}
+                placeholder="Unsigned Upload Preset"
+                className="px-3 py-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 text-xs text-slate-900 dark:text-white disabled:opacity-60"
+              />
+            </div>
+            {!cloudFromEnv && (
+              <button
+                type="button"
+                onClick={() => {
+                  saveCloudinaryConfig(cloudName, uploadPreset);
+                  showToast(
+                    cloudName.trim() && uploadPreset.trim()
+                      ? 'Pengaturan Cloudinary disimpan untuk upload media'
+                      : 'Pengaturan Cloudinary dikosongkan',
+                    'success'
+                  );
+                }}
+                className="px-3.5 py-2 rounded-xl bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 text-xs font-semibold text-slate-800 dark:text-slate-200"
+              >
+                Simpan Pengaturan Media
+              </button>
+            )}
           </div>
         </section>
 

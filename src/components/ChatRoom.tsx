@@ -39,13 +39,13 @@ import {
 } from 'lucide-react';
 import { db, handleFirestoreError, OperationType } from '../lib/firebase';
 import { decryptMessageText } from '../lib/e2ee';
-import { wsClient } from '../lib/wsClient';
 import {
   deleteMessageForAll,
   deleteMessageForMe,
   editMessageText,
   markConversationRead,
   sendMessage,
+  setTypingStatus,
   toggleMessageReaction,
   toggleStarMessage,
   uploadMediaFile,
@@ -258,21 +258,22 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
       .slice(0, 5);
   }, [mentionMatch?.[1], conv.memberUids, membersProfiles]);
 
+  const lastTypingEmitRef = useRef<number>(0);
+
   const emitTyping = (isTyping: boolean) => {
-    wsClient.send({
-      type: 'typing',
-      convId: conv.id,
-      targetUids: conv.memberUids,
-      displayName: myProfile.displayName,
-      isTyping,
-    });
+    const now = Date.now();
+    if (isTyping && now - lastTypingEmitRef.current < 1800) {
+      return;
+    }
+    lastTypingEmitRef.current = isTyping ? now : 0;
+    setTypingStatus(conv.id, myProfile.uid, myProfile.displayName, isTyping);
   };
 
   const handleInputChange = (val: string) => {
     setInputText(val);
     emitTyping(val.length > 0);
     if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
-    typingTimeoutRef.current = window.setTimeout(() => emitTyping(false), 2000);
+    typingTimeoutRef.current = window.setTimeout(() => emitTyping(false), 2500);
   };
 
   const handleSendText = async (e?: React.FormEvent) => {

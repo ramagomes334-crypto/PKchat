@@ -25,6 +25,7 @@ import {
 import { auth, googleAuthProvider } from '../lib/firebase';
 import {
   checkUsernameAvailable,
+  hashPasswordClient,
   sanitizeUsername,
   saveUserOnboarding,
   uploadMediaFile,
@@ -272,20 +273,11 @@ export const AuthView: React.FC<AuthViewProps> = ({
         return;
       }
 
-      const token = await firebaseUser.getIdToken(true);
+      await firebaseUser.getIdToken(true);
 
       let passwordHash: string | undefined;
       if (accountPin.trim().length >= 6) {
-        const hashRes = await fetch('/api/security/hash-password', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${token}`,
-          },
-          body: JSON.stringify({ password: accountPin.trim() }),
-        });
-        const hashData = await hashRes.json();
-        if (hashRes.ok) passwordHash = hashData.passwordHash;
+        passwordHash = await hashPasswordClient(accountPin.trim());
       }
 
       const e2eePublicKey = (await ensureE2EEKeyPair(firebaseUser.uid)) || '';

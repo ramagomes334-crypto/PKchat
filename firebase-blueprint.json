@@ -295,6 +295,34 @@
         "createdAt": { "type": "string", "format": "date-time" }
       },
       "required": ["id", "reporterUid", "reportedUid", "reason", "createdAt"]
+    },
+    "TypingStatus": {
+      "title": "TypingStatus",
+      "description": "Real-time typing indicator for a conversation participant.",
+      "type": "object",
+      "properties": {
+        "convId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "uid": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "displayName": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "isTyping": { "type": "boolean" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["convId", "uid", "displayName", "isTyping", "updatedAt"]
+    },
+    "CallSignal": {
+      "title": "CallSignal",
+      "description": "WebRTC SDP offer/answer or ICE candidate signal stored in Firestore for serverless calls.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "callId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "senderUid": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "targetUid": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "type": { "type": "string", "enum": ["offer", "answer", "ice-candidate"] },
+        "payload": { "type": "string", "minLength": 2, "maxLength": 16000 },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "callId", "senderUid", "targetUid", "type", "payload", "createdAt"]
     }
   },
   "firestore": {
@@ -346,6 +374,10 @@
       "schema": { "$ref": "#/entities/Message" },
       "description": "Messages belonging to a conversation."
     },
+    "/conversations/{convId}/typing/{uid}": {
+      "schema": { "$ref": "#/entities/TypingStatus" },
+      "description": "Live typing indicator per member in a conversation."
+    },
     "/statuses/{statusId}": {
       "schema": { "$ref": "#/entities/StatusPost" },
       "description": "24-hour user status updates."
@@ -357,6 +389,10 @@
     "/calls/{callId}": {
       "schema": { "$ref": "#/entities/CallRecord" },
       "description": "Audio and video call records."
+    },
+    "/calls/{callId}/signals/{signalId}": {
+      "schema": { "$ref": "#/entities/CallSignal" },
+      "description": "WebRTC SDP and ICE signaling packets between call participants."
     },
     "/reports/{reportId}": {
       "schema": { "$ref": "#/entities/UserReport" },

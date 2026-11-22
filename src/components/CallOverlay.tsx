@@ -1,7 +1,8 @@
 import React, { useEffect, useRef, useState } from 'react';
+import { collection, doc, onSnapshot, query, where } from 'firebase/firestore';
 import { Mic, MicOff, Phone, PhoneOff, Video, VideoOff } from 'lucide-react';
-import { wsClient } from '../lib/wsClient';
-import { playNotificationChime, updateCallDoc } from '../lib/chatService';
+import { db } from '../lib/firebase';
+import { playNotificationChime, sendCallSignal, updateCallDoc } from '../lib/chatService';
 import { Avatar } from './PKLogo';
 import { useToast } from './ToastProvider';
 
@@ -48,6 +49,9 @@ export const CallOverlay: React.FC<CallOverlayProps> = ({
   const remoteVideoRef = useRef<HTMLVideoElement | null>(null);
   const remoteAudioRef = useRef<HTMLAudioElement | null>(null);
   const pendingCandidates = useRef<RTCIceCandidateInit[]>([]);
+  const seenSignalsRef = useRef<Set<string>>(new Set());
+  const offerSentRef = useRef(false);
+  const closingRef = useRef(false);
 
   const cleanupMedia = () => {
     if (localStreamRef.current) {
@@ -59,9 +63,13 @@ export const CallOverlay: React.FC<CallOverlayProps> = ({
       pcRef.current = null;
     }
     pendingCandidates.current = [];
+    seenSignalsRef.current.clear();
+    offerSentRef.current = false;
   };
 
   const setupPeerConnection = async (isVideo: boolean, targetUid: string, callId: string) => {
+    if (pcRef.current) return pcRef.current;
+
     const stream = await navigator.mediaDevices.getUserMedia({
       audio: true,
       video: isVideo,
@@ -78,11 +86,12 @@ export const CallOverlay: React.FC<CallOverlayProps> = ({
 
     pc.onicecandidate = (event) => {
       if (event.candidate) {
-        wsClient.send({
-          type: 'call:ice-candidate',
-          targetUid,
+        sendCallSignal({
           callId,
-          candidate: event.candidate,
+          senderUid: myUid,
+          targetUid,
+          type: 'ice-candidate',
+          payload: event.candidate.toJSON(),
         });
       }
     };
@@ -103,10 +112,12 @@ export const CallOverlay: React.FC<CallOverlayProps> = ({
   useEffect(() => {
     if (!session) {
       cleanupMedia();
+      closingRef.current = false;
       setElapsed(0);
       return;
     }
 
+    closingRef.current = false;
     let ringInterval: number | undefined;
     let missTimeout: number | undefined;
     if (session.status === 'ringing') {
@@ -115,101 +126,127 @@ export const CallOverlay: React.FC<CallOverlayProps> = ({
         ringInterval = window.setInterval(() => playNotificationChime('call'), 3200);
       }
       missTimeout = window.setTimeout(() => {
-        if (session.direction === 'outgoing') {
-          wsClient.send({
-            type: 'call:end',
-            targetUid: session.peerUid,
-            callId: session.callId,
-          });
+        if (!closingRef.current) {
+          closingRef.current = true;
+          updateCallDoc(session.callId, 'missed', 0);
+          cleanupMedia();
+          onClose();
+          showToast('Panggilan tidak terjawab', 'info');
         }
-        updateCallDoc(session.callId, 'missed', 0);
-        cleanupMedia();
-        onClose();
-        showToast('Panggilan tidak terjawab', 'info');
       }, 45000);
     }
 
-    const unsub = wsClient.subscribe(async (msg) => {
-      if (!session || msg.callId !== session.callId) return;
+    const unsubCallDoc = onSnapshot(
+      doc(db, 'calls', session.callId),
+      async (snap) => {
+        if (!snap.exists() || closingRef.current) return;
+        const data = snap.data() as { status?: string };
 
-      if (msg.type === 'call:accept' && session.direction === 'outgoing') {
-        try {
-          onUpdateStatus('active');
-          await updateCallDoc(session.callId, 'active', 0);
-          const pc = await setupPeerConnection(
-            session.callType === 'video',
-            session.peerUid,
-            session.callId
-          );
-          const offer = await pc.createOffer();
-          await pc.setLocalDescription(offer);
-          wsClient.send({
-            type: 'call:offer',
-            targetUid: session.peerUid,
-            callId: session.callId,
-            sdp: offer,
-          });
-        } catch {
-          showToast('Gagal mengakses mikrofon atau kamera', 'error');
-          handleHangup('ended');
-        }
-      }
-
-      if (msg.type === 'call:offer') {
-        try {
-          const pc =
-            pcRef.current ||
-            (await setupPeerConnection(
+        if (data.status === 'active' && session.direction === 'outgoing' && !offerSentRef.current) {
+          offerSentRef.current = true;
+          try {
+            onUpdateStatus('active');
+            const pc = await setupPeerConnection(
               session.callType === 'video',
               session.peerUid,
               session.callId
-            ));
-          await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
-          for (const cand of pendingCandidates.current) {
-            await pc.addIceCandidate(new RTCIceCandidate(cand));
+            );
+            const offer = await pc.createOffer();
+            await pc.setLocalDescription(offer);
+            await sendCallSignal({
+              callId: session.callId,
+              senderUid: myUid,
+              targetUid: session.peerUid,
+              type: 'offer',
+              payload: offer,
+            });
+          } catch {
+            showToast('Gagal mengakses mikrofon atau kamera', 'error');
+            handleHangup('ended');
           }
-          pendingCandidates.current = [];
-          const answer = await pc.createAnswer();
-          await pc.setLocalDescription(answer);
-          wsClient.send({
-            type: 'call:answer',
-            targetUid: session.peerUid,
-            callId: session.callId,
-            sdp: answer,
-          });
-        } catch {
-          showToast('Koneksi panggilan WebRTC gagal', 'error');
         }
-      }
 
-      if (msg.type === 'call:answer' && pcRef.current) {
-        await pcRef.current.setRemoteDescription(new RTCSessionDescription(msg.sdp));
-        for (const cand of pendingCandidates.current) {
-          await pcRef.current.addIceCandidate(new RTCIceCandidate(cand));
+        if (
+          (data.status === 'rejected' || data.status === 'ended' || data.status === 'missed') &&
+          !closingRef.current
+        ) {
+          closingRef.current = true;
+          cleanupMedia();
+          onClose();
+          showToast(
+            data.status === 'rejected'
+              ? 'Panggilan ditolak'
+              : data.status === 'missed'
+              ? 'Panggilan tidak terjawab'
+              : 'Panggilan berakhir',
+            'info'
+          );
         }
-        pendingCandidates.current = [];
-      }
+      },
+      () => {}
+    );
 
-      if (msg.type === 'call:ice-candidate' && msg.candidate) {
-        if (pcRef.current && pcRef.current.remoteDescription) {
-          await pcRef.current.addIceCandidate(new RTCIceCandidate(msg.candidate));
-        } else {
-          pendingCandidates.current.push(msg.candidate);
+    const unsubSignals = onSnapshot(
+      query(collection(db, 'calls', session.callId, 'signals'), where('targetUid', '==', myUid)),
+      async (snap) => {
+        const ordered = snap.docs
+          .map((d) => d.data() as {
+            id: string;
+            type: 'offer' | 'answer' | 'ice-candidate';
+            payload: string;
+            createdAt?: { toMillis?: () => number };
+          })
+          .sort((a, b) => (a.createdAt?.toMillis?.() ?? 0) - (b.createdAt?.toMillis?.() ?? 0));
+
+        for (const sig of ordered) {
+          if (seenSignalsRef.current.has(sig.id)) continue;
+          seenSignalsRef.current.add(sig.id);
+          try {
+            const parsed = JSON.parse(sig.payload);
+            if (sig.type === 'offer') {
+              const pc = await setupPeerConnection(
+                session.callType === 'video',
+                session.peerUid,
+                session.callId
+              );
+              await pc.setRemoteDescription(new RTCSessionDescription(parsed));
+              for (const cand of pendingCandidates.current) {
+                await pc.addIceCandidate(new RTCIceCandidate(cand));
+              }
+              pendingCandidates.current = [];
+              const answer = await pc.createAnswer();
+              await pc.setLocalDescription(answer);
+              await sendCallSignal({
+                callId: session.callId,
+                senderUid: myUid,
+                targetUid: session.peerUid,
+                type: 'answer',
+                payload: answer,
+              });
+            } else if (sig.type === 'answer' && pcRef.current && !pcRef.current.currentRemoteDescription) {
+              await pcRef.current.setRemoteDescription(new RTCSessionDescription(parsed));
+              for (const cand of pendingCandidates.current) {
+                await pcRef.current.addIceCandidate(new RTCIceCandidate(cand));
+              }
+              pendingCandidates.current = [];
+            } else if (sig.type === 'ice-candidate') {
+              if (pcRef.current && pcRef.current.remoteDescription) {
+                await pcRef.current.addIceCandidate(new RTCIceCandidate(parsed));
+              } else {
+                pendingCandidates.current.push(parsed);
+              }
+            }
+          } catch {
+            // Ignore stale or malformed signaling frame
+          }
         }
-      }
-
-      if (msg.type === 'call:reject' || msg.type === 'call:end') {
-        cleanupMedia();
-        onClose();
-        showToast(
-          msg.type === 'call:reject' ? 'Panggilan ditolak' : 'Panggilan berakhir',
-          'info'
-        );
-      }
-    });
+      },
+      () => {}
+    );
 
     return () => {
-      unsub();
+      unsubCallDoc();
+      unsubSignals();
       if (ringInterval) clearInterval(ringInterval);
       if (missTimeout) clearTimeout(missTimeout);
     };
@@ -232,16 +269,10 @@ export const CallOverlay: React.FC<CallOverlayProps> = ({
   };
 
   const handleAccept = async () => {
-    onUpdateStatus('active');
-    await updateCallDoc(session.callId, 'active', 0);
     try {
       await setupPeerConnection(session.callType === 'video', session.peerUid, session.callId);
-      wsClient.send({
-        type: 'call:accept',
-        targetUid: session.peerUid,
-        callId: session.callId,
-        fromUid: myUid,
-      });
+      onUpdateStatus('active');
+      await updateCallDoc(session.callId, 'active', 0);
     } catch {
       showToast('Izin mikrofon/kamera ditolak oleh browser', 'error');
       handleHangup('ended');
@@ -249,23 +280,15 @@ export const CallOverlay: React.FC<CallOverlayProps> = ({
   };
 
   const handleReject = async () => {
-    wsClient.send({
-      type: 'call:reject',
-      targetUid: session.peerUid,
-      callId: session.callId,
-    });
+    closingRef.current = true;
     await updateCallDoc(session.callId, 'rejected', 0);
     cleanupMedia();
     onClose();
   };
 
   const handleHangup = async (endStatus: 'ended' | 'missed' = 'ended') => {
+    closingRef.current = true;
     const finalStatus = session.status === 'ringing' && session.direction === 'outgoing' ? 'missed' : endStatus;
-    wsClient.send({
-      type: 'call:end',
-      targetUid: session.peerUid,
-      callId: session.callId,
-    });
     await updateCallDoc(session.callId, finalStatus, elapsed);
     cleanupMedia();
     onClose();
