@@ -1,0 +1,6 @@
+{
+  "name": "PK Chat",
+  "description": "Aplikasi chatting modern real-time dengan enkripsi end-to-end, grup, status 24 jam, dan panggilan suara/video WebRTC untuk website dan mobile.",
+  "requestFramePermissions": ["camera", "microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

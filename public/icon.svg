@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" fill="none">
+  <defs>
+    <linearGradient id="pkGrad" x1="0" y1="0" x2="512" y2="512" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#10B981"/>
+      <stop offset="100%" stop-color="#047857"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="116" fill="url(#pkGrad)"/>
+  <path d="M256 106C166.5 106 94 170.5 94 250C94 282.6 106.2 312.7 126.9 337L105 406L180.4 384.4C203.2 394.6 228.9 400 256 400C345.5 400 418 335.5 418 256C418 176.5 345.5 106 256 106Z" fill="white" fill-opacity="0.96"/>
+  <text x="256" y="286" text-anchor="middle" font-family="Plus Jakarta Sans, system-ui, -apple-system, sans-serif" font-weight="800" font-size="128" letter-spacing="-4" fill="#047857">PK</text>
+</svg>
