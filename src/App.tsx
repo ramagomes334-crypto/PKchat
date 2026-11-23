@@ -15,6 +15,7 @@ import {
   Archive,
   Bell,
   BellOff,
+  Bookmark,
   Camera,
   CheckCheck,
   CircleDot,
@@ -28,6 +29,7 @@ import {
   Settings,
   Star,
   Trash2,
+  UserPlus,
   Users,
   X,
 } from 'lucide-react';
@@ -35,17 +37,19 @@ import { auth, db, handleFirestoreError, OperationType } from './lib/firebase';
 import { decryptMessageText, ensureE2EEKeyPair } from './lib/e2ee';
 import { wsClient } from './lib/wsClient';
 import {
+  addUserToContacts,
   clearAllNotifications,
   createCallDoc,
+  findUserExactForAdd,
   getDeviceInfo,
   getOrCreatePrivateConversation,
-  listDiscoverableUsers,
+  getOrCreateSavedMessagesConversation,
   markAllNotificationsRead,
   playNotificationChime,
-  searchUsersByQuery,
   sendBrowserNotification,
   updateMemberConversationPref,
   uploadMediaFile,
+  verifyPasswordClient,
 } from './lib/chatService';
 import type {
   BlockedUser,
@@ -116,12 +120,19 @@ function PKChatApp() {
   const [loadingStarred, setLoadingStarred] = useState(false);
   const [globalStarred, setGlobalStarred] = useState<{ conv: Conversation; msg: Message; display: string }[]>([]);
 
-  // New Chat Modal
+  // New Chat Modal (Private Contact-First Discovery)
   const [showNewChatModal, setShowNewChatModal] = useState(false);
   const [newChatQuery, setNewChatQuery] = useState('');
-  const [newChatResults, setNewChatResults] = useState<UserProfile[]>([]);
-  const [discoverableUsers, setDiscoverableUsers] = useState<UserProfile[]>([]);
-  const [searchingNewChat, setSearchingNewChat] = useState(false);
+  const [addContactQuery, setAddContactQuery] = useState('');
+  const [addContactResult, setAddContactResult] = useState<UserProfile | null>(null);
+  const [addContactSearched, setAddContactSearched] = useState(false);
+  const [addContactLoading, setAddContactLoading] = useState(false);
+
+  // App Lock PIN
+  const [appLockHash, setAppLockHash] = useState<string | null>(null);
+  const [appLocked, setAppLocked] = useState(false);
+  const [pinUnlockInput, setPinUnlockInput] = useState('');
+  const [pinUnlockError, setPinUnlockError] = useState('');
 
   // Core Data Collections
   const [conversations, setConversations] = useState<Conversation[]>([]);
@@ -164,6 +175,16 @@ function PKChatApp() {
     applyTheme(settings.theme);
   }, [settings.theme]);
 
+  useEffect(() => {
+    const unreadMsgs = Object.values(memberStates)
+      .filter((s) => !s.archived && s.unreadCount > 0)
+      .reduce((sum, s) => sum + s.unreadCount, 0);
+    document.title =
+      unreadMsgs > 0
+        ? `(${unreadMsgs}) PK Chat — Pesan Instan Modern`
+        : 'PK Chat — Pesan Instan Modern & Terenkripsi';
+  }, [memberStates]);
+
   // Listen to Firebase Auth
   useEffect(() => {
     const unsub = onAuthStateChanged(auth, async (user) => {
@@ -171,9 +192,25 @@ function PKChatApp() {
       if (!user) {
         setMyProfile(null);
         setNeedsOnboarding(false);
+        setAppLockHash(null);
+        setAppLocked(false);
         setAuthReady(true);
         wsClient.disconnect();
         return;
+      }
+
+      try {
+        const savedPin = localStorage.getItem(`pk_chat_pin_${user.uid}`);
+        if (savedPin) {
+          setAppLockHash(savedPin);
+          setAppLocked(true);
+        } else {
+          setAppLockHash(null);
+          setAppLocked(false);
+        }
+      } catch {
+        setAppLockHash(null);
+        setAppLocked(false);
       }
 
       const snap = await getDoc(doc(db, 'users', user.uid));
@@ -554,6 +591,14 @@ function PKChatApp() {
     }
   }, [notifications[0]?.id]);
 
+  const contactsByUid = useMemo(() => {
+    const map: Record<string, Contact> = {};
+    contacts.forEach((c) => {
+      map[c.contactUid] = c;
+    });
+    return map;
+  }, [contacts]);
+
   const activeConv = useMemo(
     () => conversations.find((c) => c.id === activeConvId) || null,
     [conversations, activeConvId]
@@ -562,8 +607,12 @@ function PKChatApp() {
   const activePeerProfile = useMemo(() => {
     if (!activeConv || activeConv.type !== 'private' || !myProfile) return null;
     const peerUid = activeConv.memberUids.find((u) => u !== myProfile.uid);
-    return peerUid ? profilesCache[peerUid] || null : null;
-  }, [activeConv, myProfile?.uid, profilesCache]);
+    if (!peerUid) return null;
+    const peer = profilesCache[peerUid];
+    if (!peer) return null;
+    const contact = contactsByUid[peerUid];
+    return contact?.aliasName ? { ...peer, displayName: contact.aliasName } : peer;
+  }, [activeConv, myProfile?.uid, profilesCache, contactsByUid]);
 
   const sortedConversations = useMemo(() => {
     const filtered = conversations.filter((c) => {
@@ -577,11 +626,13 @@ function PKChatApp() {
 
     const searched = chatSearch.trim()
       ? filtered.filter((c) => {
+          const isSelf = c.id.startsWith('self_') || (c.type === 'private' && c.memberUids.length === 1);
           const otherUid = c.memberUids.find((u) => u !== myProfile?.uid);
-          const title =
-            c.type === 'group'
-              ? c.title || ''
-              : (otherUid && profilesCache[otherUid]?.displayName) || '';
+          const title = isSelf
+            ? 'Catatan Tersimpan'
+            : c.type === 'group'
+            ? c.title || ''
+            : (otherUid && (contactsByUid[otherUid]?.aliasName || profilesCache[otherUid]?.displayName)) || '';
           return (
             title.toLowerCase().includes(chatSearch.toLowerCase()) ||
             (c.lastMessageText || '').toLowerCase().includes(chatSearch.toLowerCase())
@@ -597,7 +648,7 @@ function PKChatApp() {
       const timeB = b.lastMessageAt?.toMillis?.() || b.updatedAt?.toMillis?.() || 0;
       return timeB - timeA;
     });
-  }, [conversations, memberStates, chatFilter, chatSearch, profilesCache, myProfile?.uid]);
+  }, [conversations, memberStates, chatFilter, chatSearch, profilesCache, contactsByUid, myProfile?.uid]);
 
   const handleStartCall = async (
     peerUid: string,
@@ -635,37 +686,19 @@ function PKChatApp() {
     }
   };
 
-  useEffect(() => {
-    if (!showNewChatModal || !myProfile) return;
-    let active = true;
-    setSearchingNewChat(true);
-    listDiscoverableUsers(myProfile.uid)
-      .then((list) => {
-        if (active) setDiscoverableUsers(list);
-      })
-      .catch(() => {})
-      .finally(() => {
-        if (active) setSearchingNewChat(false);
-      });
-    return () => {
-      active = false;
-    };
-  }, [showNewChatModal, myProfile?.uid]);
-
-  const handleSearchNewChat = async (q: string) => {
-    setNewChatQuery(q);
-    if (!myProfile || q.trim().length < 2) {
-      setNewChatResults([]);
-      return;
-    }
-    setSearchingNewChat(true);
+  const handleExactLookupForAdd = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!myProfile || !addContactQuery.trim()) return;
+    setAddContactLoading(true);
+    setAddContactSearched(false);
     try {
-      const found = await searchUsersByQuery(q, myProfile.uid);
-      setNewChatResults(found);
+      const found = await findUserExactForAdd(addContactQuery, myProfile.uid);
+      setAddContactResult(found);
+      setAddContactSearched(true);
     } catch {
       showToast('Gagal mencari pengguna', 'error');
     } finally {
-      setSearchingNewChat(false);
+      setAddContactLoading(false);
     }
   };
 
@@ -680,10 +713,65 @@ function PKChatApp() {
       setProfilesCache((prev) => ({ ...prev, [peer.uid]: peer }));
       setShowNewChatModal(false);
       setNewChatQuery('');
+      setAddContactQuery('');
+      setAddContactResult(null);
+      setAddContactSearched(false);
       setActiveConvId(convId);
       setActiveTab('chats');
     } catch {
       showToast('Gagal membuka percakapan dengan pengguna ini', 'error');
+    }
+  };
+
+  const handleAddAndOpenChat = async (peer: UserProfile) => {
+    if (!myProfile) return;
+    try {
+      await addUserToContacts(myProfile.uid, peer);
+      showToast(`${peer.displayName} ditambahkan ke kontak`, 'success');
+      await handleOpenChatWithUser(peer);
+    } catch {
+      showToast('Gagal menambahkan kontak', 'error');
+    }
+  };
+
+  const handleOpenSavedMessages = async () => {
+    if (!myProfile) return;
+    try {
+      const convId = await getOrCreateSavedMessagesConversation(myProfile);
+      setShowNewChatModal(false);
+      setActiveConvId(convId);
+      setActiveTab('chats');
+    } catch {
+      showToast('Gagal membuka Catatan Tersimpan', 'error');
+    }
+  };
+
+  const handleSaveAppLock = (pinHash: string | null) => {
+    if (!firebaseUser) return;
+    try {
+      if (pinHash) {
+        localStorage.setItem(`pk_chat_pin_${firebaseUser.uid}`, pinHash);
+        setAppLockHash(pinHash);
+      } else {
+        localStorage.removeItem(`pk_chat_pin_${firebaseUser.uid}`);
+        setAppLockHash(null);
+        setAppLocked(false);
+      }
+    } catch {
+      showToast('Gagal menyimpan pengaturan kunci PIN di perangkat', 'error');
+    }
+  };
+
+  const handleUnlockApp = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!appLockHash || !pinUnlockInput.trim()) return;
+    const valid = await verifyPasswordClient(pinUnlockInput.trim(), appLockHash);
+    if (valid) {
+      setAppLocked(false);
+      setPinUnlockInput('');
+      setPinUnlockError('');
+    } else {
+      setPinUnlockError('PIN salah. Periksa kembali PIN Anda.');
     }
   };
 
@@ -841,6 +929,22 @@ function PKChatApp() {
         </div>
 
         <div className="flex flex-col items-center gap-3">
+          {appLockHash && (
+            <button
+              onClick={() => setAppLocked(true)}
+              className="w-11 h-11 rounded-2xl flex items-center justify-center text-slate-500 dark:text-slate-400 hover:bg-slate-200/70 dark:hover:bg-slate-800"
+              title="Kunci Layar Aplikasi"
+            >
+              <Lock className="w-5 h-5" />
+            </button>
+          )}
+          <button
+            onClick={handleOpenSavedMessages}
+            className="w-11 h-11 rounded-2xl flex items-center justify-center text-slate-500 dark:text-slate-400 hover:bg-slate-200/70 dark:hover:bg-slate-800"
+            title="Catatan Tersimpan"
+          >
+            <Bookmark className="w-5 h-5" />
+          </button>
           <button
             onClick={handleOpenGlobalStarred}
             className="w-11 h-11 rounded-2xl flex items-center justify-center text-slate-500 dark:text-slate-400 hover:bg-slate-200/70 dark:hover:bg-slate-800"
@@ -914,6 +1018,15 @@ function PKChatApp() {
                 <div className="absolute right-0 top-12 z-50 w-48 rounded-2xl bg-white dark:bg-[#1A242D] border border-slate-200 dark:border-slate-700 shadow-xl p-1.5 text-xs">
                   <button
                     onClick={() => {
+                      handleOpenSavedMessages();
+                      setShowHeaderMenu(false);
+                    }}
+                    className="w-full text-left px-3 py-2 rounded-xl hover:bg-slate-100 dark:hover:bg-slate-800"
+                  >
+                    Catatan Tersimpan
+                  </button>
+                  <button
+                    onClick={() => {
                       setShowNotificationsModal(true);
                       setShowHeaderMenu(false);
                     }}
@@ -949,6 +1062,17 @@ function PKChatApp() {
                   >
                     Pengaturan Akun
                   </button>
+                  {appLockHash && (
+                    <button
+                      onClick={() => {
+                        setAppLocked(true);
+                        setShowHeaderMenu(false);
+                      }}
+                      className="w-full text-left px-3 py-2 rounded-xl hover:bg-slate-100 dark:hover:bg-slate-800"
+                    >
+                      Kunci Layar
+                    </button>
+                  )}
                   <button
                     onClick={() => signOut(auth)}
                     className="w-full text-left px-3 py-2 rounded-xl text-rose-600 hover:bg-rose-50 dark:hover:bg-rose-950/40"
@@ -1062,16 +1186,24 @@ function PKChatApp() {
               ) : (
                 sortedConversations.map((c) => {
                   const isGroup = c.type === 'group';
-                  const peerUid = !isGroup ? c.memberUids.find((u) => u !== myProfile.uid) : undefined;
+                  const isSelfChat = c.id.startsWith('self_') || (!isGroup && c.memberUids.length === 1);
+                  const peerUid = !isGroup && !isSelfChat ? c.memberUids.find((u) => u !== myProfile.uid) : undefined;
                   const peer = peerUid ? profilesCache[peerUid] : undefined;
+                  const contactAlias = peerUid ? contactsByUid[peerUid]?.aliasName : undefined;
                   const state = memberStates[c.id];
-                  const title = isGroup ? c.title || 'Grup' : peer?.displayName || 'Pengguna';
-                  const avatar = isGroup
+                  const title = isSelfChat
+                    ? 'Catatan Tersimpan'
+                    : isGroup
+                    ? c.title || 'Grup'
+                    : contactAlias || peer?.displayName || 'Pengguna';
+                  const avatar = isSelfChat
+                    ? myProfile.photoURL
+                    : isGroup
                     ? c.photoURL
                     : peer?.showProfilePhoto
                     ? peer?.photoURL
                     : undefined;
-                  const isOnline = !isGroup && Boolean(peerUid && onlineUsers[peerUid] && peer?.showOnlineStatus);
+                  const isOnline = !isGroup && !isSelfChat && Boolean(peerUid && onlineUsers[peerUid] && peer?.showOnlineStatus);
                   const convTyping = Object.values(typingMap[c.id] || {});
                   const unread = state?.unreadCount || 0;
                   const isMuted = (state?.mutedUntil || 0) > Date.now();
@@ -1267,19 +1399,28 @@ function PKChatApp() {
                   Selamat Datang di PK Chat
                 </h2>
                 <p className="mt-2 text-sm text-slate-600 dark:text-slate-400 leading-relaxed">
-                  Pilih percakapan di sebelah kiri atau mulai obrolan baru dengan mencari username teman Anda.
+                  Pilih percakapan di sebelah kiri atau tambahkan kontak teman Anda menggunakan @username atau nomor HP persis.
                 </p>
                 <div className="mt-5 flex items-center justify-center gap-2 text-xs text-emerald-700 dark:text-emerald-400 font-medium">
                   <Lock className="w-3.5 h-3.5" />
                   <span>Pesan pribadi terenkripsi end-to-end</span>
                 </div>
-                <button
-                  onClick={() => setShowNewChatModal(true)}
-                  className="mt-5 inline-flex items-center gap-2 px-5 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-semibold transition-colors"
-                >
-                  <MessageSquarePlus className="w-4 h-4" />
-                  Mulai Percakapan Baru
-                </button>
+                <div className="mt-5 flex flex-wrap items-center justify-center gap-2">
+                  <button
+                    onClick={() => setShowNewChatModal(true)}
+                    className="inline-flex items-center gap-2 px-5 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-semibold transition-colors"
+                  >
+                    <MessageSquarePlus className="w-4 h-4" />
+                    Mulai Percakapan Baru
+                  </button>
+                  <button
+                    onClick={handleOpenSavedMessages}
+                    className="inline-flex items-center gap-2 px-4 py-2.5 rounded-xl border border-slate-200 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-800 text-xs font-semibold transition-colors"
+                  >
+                    <Bookmark className="w-4 h-4 text-emerald-600" />
+                    Catatan Tersimpan
+                  </button>
+                </div>
               </div>
             </div>
           )
@@ -1319,6 +1460,9 @@ function PKChatApp() {
             myProfile={myProfile}
             settings={settings}
             blockedUsers={blockedUsers}
+            hasAppLock={Boolean(appLockHash)}
+            onSaveAppLock={handleSaveAppLock}
+            onLockNow={() => setAppLocked(true)}
             onApplyTheme={(t) => applyTheme(t)}
             onApplyFontSize={(sz) => setSettings((prev) => ({ ...prev, fontSize: sz }))}
           />
@@ -1355,7 +1499,7 @@ function PKChatApp() {
         </nav>
       )}
 
-      {/* New Chat Modal */}
+      {/* New Chat Modal (Private Contact-First Discovery) */}
       {showNewChatModal && (
         <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4">
           <div className="w-full max-w-md rounded-3xl bg-white dark:bg-[#111820] border border-slate-200 dark:border-slate-800 p-6 space-y-4 shadow-xl">
@@ -1368,114 +1512,151 @@ function PKChatApp() {
               </button>
             </div>
 
+            <div className="grid grid-cols-2 gap-2">
+              <button
+                type="button"
+                onClick={() => {
+                  setShowNewChatModal(false);
+                  setActiveTab('communities');
+                  setCreateGroupSignal((s) => s + 1);
+                }}
+                className="flex items-center gap-2.5 p-2.5 rounded-2xl bg-emerald-50 dark:bg-emerald-950/40 hover:bg-emerald-100/70 dark:hover:bg-emerald-950/70 text-emerald-700 dark:text-emerald-300 text-xs font-semibold transition-colors"
+              >
+                <div className="w-7 h-7 rounded-full bg-emerald-600 text-white flex items-center justify-center shrink-0">
+                  <Users className="w-3.5 h-3.5" />
+                </div>
+                <span className="truncate">Buat Grup Baru</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={handleOpenSavedMessages}
+                className="flex items-center gap-2.5 p-2.5 rounded-2xl bg-slate-100 dark:bg-slate-800/80 hover:bg-slate-200/70 dark:hover:bg-slate-800 text-slate-800 dark:text-slate-200 text-xs font-semibold transition-colors"
+              >
+                <div className="w-7 h-7 rounded-full bg-emerald-600/15 text-emerald-600 dark:text-emerald-400 flex items-center justify-center shrink-0">
+                  <Bookmark className="w-3.5 h-3.5" />
+                </div>
+                <span className="truncate">Catatan Tersimpan</span>
+              </button>
+            </div>
+
+            {/* Private Add Contact Form (Exact Lookup Only) */}
+            <form
+              onSubmit={handleExactLookupForAdd}
+              className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-900/50 p-3 space-y-2"
+            >
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-xs font-semibold text-slate-800 dark:text-slate-200">
+                  Tambah Kontak Baru
+                </span>
+                <span className="text-[10px] text-slate-400">Privasi Ketat · Add Dulu</span>
+              </div>
+              <div className="flex gap-2">
+                <input
+                  type="text"
+                  value={addContactQuery}
+                  onChange={(e) => {
+                    setAddContactQuery(e.target.value);
+                    setAddContactSearched(false);
+                    setAddContactResult(null);
+                  }}
+                  placeholder="@username persis atau no. HP..."
+                  className="flex-1 px-3 py-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-xs"
+                />
+                <button
+                  type="submit"
+                  disabled={addContactLoading || addContactQuery.trim().length < 3}
+                  className="px-3.5 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-semibold disabled:opacity-50"
+                >
+                  {addContactLoading ? '...' : 'Cari'}
+                </button>
+              </div>
+
+              {addContactSearched && !addContactResult && (
+                <p className="text-[11px] text-slate-500">
+                  Pengguna tidak ditemukan. Pastikan penulisan @username atau nomor HP sudah persis.
+                </p>
+              )}
+
+              {addContactResult && (
+                <div className="flex items-center justify-between gap-2 pt-1">
+                  <div className="flex items-center gap-2.5 min-w-0">
+                    <Avatar name={addContactResult.displayName} src={addContactResult.photoURL} size="sm" />
+                    <div className="min-w-0">
+                      <div className="text-xs font-semibold truncate">{addContactResult.displayName}</div>
+                      <div className="text-[11px] text-slate-500 truncate">@{addContactResult.username}</div>
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => handleAddAndOpenChat(addContactResult)}
+                    className="px-3 py-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-[11px] font-semibold flex items-center gap-1 shrink-0"
+                  >
+                    <UserPlus className="w-3.5 h-3.5" />
+                    {contactsByUid[addContactResult.uid] ? 'Chat' : 'Add & Chat'}
+                  </button>
+                </div>
+              )}
+            </form>
+
+            {/* Filter saved contacts ONLY */}
             <div className="relative">
               <Search className="w-4 h-4 text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2" />
               <input
                 type="text"
-                autoFocus
                 value={newChatQuery}
-                onChange={(e) => handleSearchNewChat(e.target.value)}
-                placeholder="Cari @username, nama, atau nomor HP..."
-                className="w-full pl-10 pr-4 py-2.5 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 text-sm"
+                onChange={(e) => setNewChatQuery(e.target.value)}
+                placeholder="Filter kontak yang sudah Anda tambahkan..."
+                className="w-full pl-10 pr-4 py-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 text-xs"
               />
             </div>
 
-            <button
-              type="button"
-              onClick={() => {
-                setShowNewChatModal(false);
-                setActiveTab('communities');
-                setCreateGroupSignal((s) => s + 1);
-              }}
-              className="w-full flex items-center gap-3 p-2.5 rounded-2xl bg-emerald-50 dark:bg-emerald-950/40 hover:bg-emerald-100/70 dark:hover:bg-emerald-950/70 text-emerald-700 dark:text-emerald-300 text-xs font-semibold transition-colors"
-            >
-              <div className="w-8 h-8 rounded-full bg-emerald-600 text-white flex items-center justify-center">
-                <Users className="w-4 h-4" />
-              </div>
-              <span>Buat Grup Baru</span>
-            </button>
+            <div className="max-h-56 overflow-y-auto divide-y divide-slate-100 dark:divide-slate-800">
+              {(() => {
+                const needle = newChatQuery.trim().toLowerCase();
+                const filteredContacts = contacts.filter(
+                  (c) =>
+                    !needle ||
+                    c.aliasName.toLowerCase().includes(needle) ||
+                    c.displayName.toLowerCase().includes(needle) ||
+                    c.username.toLowerCase().includes(needle)
+                );
 
-            <div className="max-h-72 overflow-y-auto divide-y divide-slate-100 dark:divide-slate-800">
-              {searchingNewChat && (
-                <div className="py-4 text-center text-xs text-slate-400">Mencari pengguna...</div>
-              )}
+                if (filteredContacts.length === 0) {
+                  return (
+                    <div className="py-5 text-center text-xs text-slate-500">
+                      {contacts.length === 0
+                        ? 'Daftar kontak masih kosong. Tambahkan teman lewat @username atau nomor HP persis di atas.'
+                        : 'Tidak ada kontak yang cocok dengan filter Anda.'}
+                    </div>
+                  );
+                }
 
-              {!searchingNewChat && newChatQuery.trim().length >= 2 && newChatResults.length === 0 && (
-                <div className="py-4 text-center text-xs text-slate-500">
-                  Pengguna tidak ditemukan. Coba kata kunci @username atau nomor HP lain.
-                </div>
-              )}
-
-              {(newChatQuery.trim().length >= 2 ? newChatResults : []).map((u) => (
-                <button
-                  key={u.uid}
-                  onClick={() => handleOpenChatWithUser(u)}
-                  className="w-full flex items-center gap-3 py-3 px-2 hover:bg-slate-50 dark:hover:bg-slate-800/50 text-left rounded-xl"
-                >
-                  <Avatar name={u.displayName} src={u.photoURL} size="sm" />
-                  <div className="min-w-0 flex-1">
-                    <div className="text-sm font-semibold truncate">{u.displayName}</div>
-                    <div className="text-xs text-slate-500">@{u.username}</div>
-                  </div>
-                </button>
-              ))}
-
-              {newChatQuery.trim().length < 2 && contacts.length > 0 && (
-                <div>
-                  <div className="text-[11px] font-semibold text-slate-400 mb-1">Kontak Anda</div>
-                  {contacts.map((c) => (
-                    <button
-                      key={c.contactUid}
-                      onClick={() =>
-                        handleOpenChatWithUser({
-                          uid: c.contactUid,
-                          username: c.username,
-                          displayName: c.displayName,
-                          photoURL: c.photoURL,
-                          isOnline: false,
-                          showOnlineStatus: true,
-                          showLastSeen: true,
-                          showProfilePhoto: true,
-                        })
-                      }
-                      className="w-full flex items-center gap-3 py-2.5 px-2 hover:bg-slate-50 dark:hover:bg-slate-800/50 text-left rounded-xl"
-                    >
-                      <Avatar name={c.aliasName} src={c.photoURL} size="sm" />
-                      <div className="min-w-0 flex-1">
-                        <div className="text-sm font-semibold truncate">{c.aliasName}</div>
-                        <div className="text-xs text-slate-500">@{c.username}</div>
-                      </div>
-                    </button>
-                  ))}
-                </div>
-              )}
-
-              {newChatQuery.trim().length < 2 && discoverableUsers.length > 0 && (
-                <div className={contacts.length > 0 ? 'pt-2' : ''}>
-                  <div className="text-[11px] font-semibold text-slate-400 mb-1">Pengguna Terdaftar</div>
-                  {discoverableUsers
-                    .filter((u) => !contacts.some((c) => c.contactUid === u.uid))
-                    .map((u) => (
-                      <button
-                        key={u.uid}
-                        onClick={() => handleOpenChatWithUser(u)}
-                        className="w-full flex items-center gap-3 py-2.5 px-2 hover:bg-slate-50 dark:hover:bg-slate-800/50 text-left rounded-xl"
-                      >
-                        <Avatar name={u.displayName} src={u.photoURL} size="sm" online={Boolean(onlineUsers[u.uid] || u.isOnline)} />
-                        <div className="min-w-0 flex-1">
-                          <div className="text-sm font-semibold truncate">{u.displayName}</div>
-                          <div className="text-xs text-slate-500">@{u.username}</div>
-                        </div>
-                      </button>
-                    ))}
-                </div>
-              )}
-
-              {!searchingNewChat && newChatQuery.trim().length < 2 && contacts.length === 0 && discoverableUsers.length === 0 && (
-                <div className="py-4 text-center text-xs text-slate-500">
-                  Belum ada pengguna lain yang terdaftar. Ajak teman melalui tab Komunitas.
-                </div>
-              )}
+                return filteredContacts.map((c) => (
+                  <button
+                    key={c.contactUid}
+                    onClick={() =>
+                      handleOpenChatWithUser({
+                        uid: c.contactUid,
+                        username: c.username,
+                        displayName: c.displayName,
+                        photoURL: c.photoURL,
+                        isOnline: false,
+                        showOnlineStatus: true,
+                        showLastSeen: true,
+                        showProfilePhoto: true,
+                      })
+                    }
+                    className="w-full flex items-center gap-3 py-2.5 px-2 hover:bg-slate-50 dark:hover:bg-slate-800/50 text-left rounded-xl"
+                  >
+                    <Avatar name={c.aliasName} src={c.photoURL} size="sm" />
+                    <div className="min-w-0 flex-1">
+                      <div className="text-sm font-semibold truncate">{c.aliasName}</div>
+                      <div className="text-xs text-slate-500">@{c.username}</div>
+                    </div>
+                  </button>
+                ));
+              })()}
             </div>
           </div>
         </div>
@@ -1563,11 +1744,13 @@ function PKChatApp() {
                 </p>
               ) : (
                 globalStarred.map(({ conv, msg, display }) => {
+                  const isSelf = conv.id.startsWith('self_') || (conv.type === 'private' && conv.memberUids.length === 1);
                   const otherUid = conv.memberUids.find((u) => u !== myProfile.uid);
-                  const convName =
-                    conv.type === 'group'
-                      ? conv.title || 'Grup'
-                      : (otherUid && profilesCache[otherUid]?.displayName) || 'Percakapan';
+                  const convName = isSelf
+                    ? 'Catatan Tersimpan'
+                    : conv.type === 'group'
+                    ? conv.title || 'Grup'
+                    : (otherUid && (contactsByUid[otherUid]?.aliasName || profilesCache[otherUid]?.displayName)) || 'Percakapan';
                   return (
                     <button
                       key={msg.id}
@@ -1607,6 +1790,58 @@ function PKChatApp() {
         }
         onClose={() => setActiveCall(null)}
       />
+
+      {/* App Lock PIN Overlay */}
+      {appLockHash && appLocked && (
+        <div className="fixed inset-0 z-[100] bg-slate-950/95 backdrop-blur-md flex items-center justify-center p-4">
+          <form
+            onSubmit={handleUnlockApp}
+            className="w-full max-w-sm rounded-3xl bg-white dark:bg-[#111820] border border-slate-200 dark:border-slate-800 p-7 space-y-5 text-center shadow-2xl"
+          >
+            <div className="mx-auto w-14 h-14 rounded-2xl bg-emerald-50 dark:bg-emerald-950/60 text-emerald-600 flex items-center justify-center">
+              <Lock className="w-7 h-7" />
+            </div>
+            <div>
+              <h3 className="font-display text-lg font-bold text-slate-900 dark:text-white">
+                PK Chat Terkunci
+              </h3>
+              <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
+                Masukkan PIN perangkat Anda untuk membuka ruang obrolan @{myProfile.username}.
+              </p>
+            </div>
+            <input
+              type="password"
+              inputMode="numeric"
+              autoFocus
+              maxLength={12}
+              value={pinUnlockInput}
+              onChange={(e) => {
+                setPinUnlockInput(e.target.value);
+                if (pinUnlockError) setPinUnlockError('');
+              }}
+              placeholder="Masukkan PIN..."
+              className="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 text-center text-base tracking-[0.35em] font-semibold"
+            />
+            {pinUnlockError && (
+              <p className="text-xs text-rose-500 font-medium">{pinUnlockError}</p>
+            )}
+            <button
+              type="submit"
+              disabled={!pinUnlockInput.trim()}
+              className="w-full py-3 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-sm font-semibold disabled:opacity-50"
+            >
+              Buka Kunci
+            </button>
+            <button
+              type="button"
+              onClick={() => signOut(auth)}
+              className="text-xs text-slate-500 hover:text-rose-500 underline"
+            >
+              Keluar dari Akun
+            </button>
+          </form>
+        </div>
+      )}
     </div>
   );
 }

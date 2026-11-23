@@ -26,6 +26,7 @@ import {
   HardDrive,
   KeyRound,
   Laptop,
+  Link2,
   Lock,
   LogOut,
   Moon,
@@ -39,6 +40,7 @@ import {
   checkUsernameAvailable,
   deleteAccountData,
   getCloudinaryConfig,
+  hashPasswordClient,
   normalizePhoneKey,
   sanitizeUsername,
   saveCloudinaryConfig,
@@ -59,6 +61,9 @@ interface SettingsViewProps {
   myProfile: UserProfile;
   settings: UserSettings;
   blockedUsers: BlockedUser[];
+  hasAppLock?: boolean;
+  onSaveAppLock?: (pinHash: string | null) => void;
+  onLockNow?: () => void;
   onApplyTheme: (theme: 'light' | 'dark' | 'system') => void;
   onApplyFontSize: (size: 'small' | 'medium' | 'large') => void;
 }
@@ -67,6 +72,9 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   myProfile,
   settings,
   blockedUsers,
+  hasAppLock = false,
+  onSaveAppLock,
+  onLockNow,
   onApplyTheme,
   onApplyFontSize,
 }) => {
@@ -87,6 +95,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const [oldPwd, setOldPwd] = useState('');
   const [newPwd, setNewPwd] = useState('');
   const [changingPwd, setChangingPwd] = useState(false);
+  const [appPinInput, setAppPinInput] = useState('');
   const initialCloudCfg = getCloudinaryConfig();
   const [cloudName, setCloudName] = useState(initialCloudCfg.cloudName);
   const [uploadPreset, setUploadPreset] = useState(initialCloudCfg.uploadPreset);
@@ -371,6 +380,22 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               <p className="text-xs text-slate-500 dark:text-slate-400 mt-1.5">
                 ID Akun: <span className="font-mono-num">{myProfile.uid.slice(0, 12)}...</span>
               </p>
+              <button
+                type="button"
+                onClick={async () => {
+                  const link = `${window.location.origin}/?u=${myProfile.username}`;
+                  try {
+                    await navigator.clipboard.writeText(link);
+                    showToast('Tautan chat pribadi berhasil disalin!', 'success');
+                  } catch {
+                    showToast(link, 'info');
+                  }
+                }}
+                className="mt-2 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-emerald-50 dark:bg-emerald-950/60 hover:bg-emerald-100 dark:hover:bg-emerald-900/60 text-xs font-semibold text-emerald-700 dark:text-emerald-300 transition-colors"
+              >
+                <Link2 className="w-3.5 h-3.5" />
+                Salin Tautan Chat Saya (@{myProfile.username})
+              </button>
             </div>
           </div>
 
@@ -654,6 +679,72 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             )
           )}
 
+          {/* Kunci Layar PIN Aplikasi */}
+          {onSaveAppLock && (
+            <div className="p-3.5 rounded-2xl border border-slate-200 dark:border-slate-800 space-y-2.5">
+              <div className="flex items-center justify-between gap-2">
+                <div>
+                  <div className="flex items-center gap-1.5 text-sm font-medium text-slate-900 dark:text-white">
+                    <Lock className="w-4 h-4 text-emerald-600" />
+                    Kunci Layar Aplikasi (PIN Perangkat)
+                  </div>
+                  <div className="text-xs text-slate-500 dark:text-slate-400">
+                    {hasAppLock
+                      ? 'Aktif di perangkat ini. Layar chat akan terkunci dengan PIN Anda.'
+                      : 'Lindungi isi chat dengan PIN 4–8 karakter setiap kali aplikasi dibuka atau dikunci.'}
+                  </div>
+                </div>
+                {hasAppLock && onLockNow && (
+                  <button
+                    type="button"
+                    onClick={onLockNow}
+                    className="px-3 py-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-semibold shrink-0"
+                  >
+                    Kunci Sekarang
+                  </button>
+                )}
+              </div>
+              <div className="flex flex-wrap items-center gap-2">
+                <input
+                  type="password"
+                  value={appPinInput}
+                  onChange={(e) => setAppPinInput(e.target.value)}
+                  maxLength={12}
+                  placeholder={hasAppLock ? 'Ganti PIN baru (min. 4)' : 'Buat PIN (min. 4 karakter)'}
+                  className="flex-1 min-w-[160px] px-3 py-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 text-xs"
+                />
+                <button
+                  type="button"
+                  onClick={async () => {
+                    if (appPinInput.trim().length < 4) {
+                      showToast('PIN minimal 4 karakter', 'error');
+                      return;
+                    }
+                    const hash = await hashPasswordClient(appPinInput.trim());
+                    onSaveAppLock(hash);
+                    setAppPinInput('');
+                    showToast('PIN kunci aplikasi disimpan', 'success');
+                  }}
+                  className="px-3.5 py-2 rounded-xl bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 text-xs font-semibold text-slate-800 dark:text-slate-200"
+                >
+                  {hasAppLock ? 'Ubah PIN' : 'Aktifkan PIN'}
+                </button>
+                {hasAppLock && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      onSaveAppLock(null);
+                      showToast('Kunci layar PIN dimatikan', 'info');
+                    }}
+                    className="px-3 py-2 rounded-xl text-xs font-semibold text-rose-600 hover:bg-rose-50 dark:hover:bg-rose-950/40"
+                  >
+                    Matikan
+                  </button>
+                )}
+              </div>
+            </div>
+          )}
+
           {/* Pengguna Diblokir */}
           <div>
             <div className="flex items-center gap-1.5 text-xs font-semibold text-slate-600 dark:text-slate-400 mb-2">
@@ -801,12 +892,12 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
           <div className="p-4 rounded-2xl border border-slate-200 dark:border-slate-800 space-y-2.5">
             <div>
               <div className="text-sm font-semibold text-slate-900 dark:text-white">
-                Penyimpanan Media Gratis (Cloudinary untuk Netlify)
+                Penyimpanan Media Gratis (Cloudinary untuk Cloudflare Pages)
               </div>
               <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
                 {cloudFromEnv
-                  ? 'Aktif otomatis melalui environment variable Netlify/hosting.'
-                  : 'Opsional untuk upload foto, video, & voice note di hosting statis gratis seperti Netlify (buat Unsigned Upload Preset gratis di Cloudinary).'}
+                  ? 'Aktif otomatis melalui environment variable Cloudflare Pages / hosting.'
+                  : 'Opsional untuk upload foto, video, & voice note di Cloudflare Pages gratis (buat Unsigned Upload Preset gratis di Cloudinary).'}
               </p>
             </div>
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">

@@ -117,6 +117,25 @@ export async function hashPasswordClient(password: string): Promise<string> {
   return `pbkdf2:${saltHex}:${hashHex}`;
 }
 
+export async function verifyPasswordClient(password: string, storedHash: string): Promise<boolean> {
+  if (!storedHash.startsWith('pbkdf2:')) return false;
+  const parts = storedHash.split(':');
+  if (parts.length !== 3) return false;
+  const [, saltHex, expectedHex] = parts;
+  const saltMatches = saltHex.match(/.{1,2}/g);
+  if (!saltMatches) return false;
+  const saltBytes = new Uint8Array(saltMatches.map((h) => parseInt(h, 16)));
+  const enc = new TextEncoder();
+  const keyMaterial = await crypto.subtle.importKey('raw', enc.encode(password), 'PBKDF2', false, ['deriveBits']);
+  const bits = await crypto.subtle.deriveBits(
+    { name: 'PBKDF2', salt: saltBytes, iterations: 100000, hash: 'SHA-256' },
+    keyMaterial,
+    256
+  );
+  const actualHex = Array.from(new Uint8Array(bits), (b) => b.toString(16).padStart(2, '0')).join('');
+  return actualHex === expectedHex;
+}
+
 export async function uploadMediaFile(
   file: File | Blob,
   customName?: string
@@ -131,7 +150,7 @@ export async function uploadMediaFile(
     throw new Error('Ukuran file maksimal 18 MB');
   }
 
-  // 1. Direct browser upload to free Cloudinary unsigned preset (works 100% on Netlify Free)
+  // 1. Direct browser upload to free Cloudinary unsigned preset (works 100% on Cloudflare Pages)
   const cloudCfg = getCloudinaryConfig();
   if (cloudCfg.cloudName && cloudCfg.uploadPreset) {
     const form = new FormData();
@@ -175,7 +194,7 @@ export async function uploadMediaFile(
   const contentType = res.headers.get('content-type') || '';
   if (!contentType.includes('application/json')) {
     throw new Error(
-      'Upload file di Netlify butuh Cloudinary gratis. Isi Cloud Name & Upload Preset di Pengaturan → Penyimpanan Media.'
+      'Upload file di Cloudflare Pages butuh Cloudinary gratis. Isi Cloud Name & Upload Preset di Pengaturan → Penyimpanan Media.'
     );
   }
 
@@ -198,60 +217,66 @@ export async function checkUsernameAvailable(username: string): Promise<boolean>
   }
 }
 
-export async function searchUsersByQuery(rawQuery: string, myUid: string): Promise<UserProfile[]> {
-  const clean = rawQuery.trim().toLowerCase().replace(/^@/, '');
-  if (!clean) return [];
+export async function findUserExactForAdd(rawQuery: string, myUid: string): Promise<UserProfile | null> {
+  const trimmed = rawQuery.trim();
+  if (!trimmed) return null;
 
-  // Phone search if mostly digits
-  const digitsOnly = clean.replace(/[^0-9]/g, '');
-  if (digitsOnly.length >= 6 && /^[0-9+\-\s]+$/.test(rawQuery.trim())) {
-    const key = normalizePhoneKey(rawQuery);
+  // 1. Exact phone number match via opt-in phoneDirectory/{phoneKey}
+  const digitsOnly = trimmed.replace(/[^0-9]/g, '');
+  if (digitsOnly.length >= 6 && /^[0-9+\-\s]+$/.test(trimmed)) {
+    const key = normalizePhoneKey(trimmed);
     try {
       const phoneSnap = await getDoc(doc(db, 'phoneDirectory', key));
       if (phoneSnap.exists()) {
         const uid = phoneSnap.data().uid;
-        if (uid !== myUid) {
+        if (uid && uid !== myUid) {
           const userSnap = await getDoc(doc(db, 'users', uid));
-          if (userSnap.exists()) return [userSnap.data() as UserProfile];
+          if (userSnap.exists()) return userSnap.data() as UserProfile;
         }
       }
     } catch {
-      // Ignore if not found
+      // Not found
     }
+    return null;
   }
 
+  // 2. Exact @username match via usernames/{username}
+  const cleanUsername = sanitizeUsername(trimmed.replace(/^@/, ''));
+  if (cleanUsername.length < 3) return null;
+
   try {
-    const q = query(collection(db, 'users'), where('uid', '>=', ''), where('uid', '<=', '\uf8ff'), limit(40));
-    const snaps = await getDocs(q);
-    const results: UserProfile[] = [];
-    snaps.forEach((d) => {
-      const u = d.data() as UserProfile;
-      if (
-        u.uid !== myUid &&
-        (u.username.toLowerCase().includes(clean) ||
-          u.displayName.toLowerCase().includes(clean))
-      ) {
-        results.push(u);
+    const unameSnap = await getDoc(doc(db, 'usernames', cleanUsername));
+    if (unameSnap.exists()) {
+      const uid = unameSnap.data().uid;
+      if (uid && uid !== myUid) {
+        const userSnap = await getDoc(doc(db, 'users', uid));
+        if (userSnap.exists()) return userSnap.data() as UserProfile;
       }
-    });
-    return results;
-  } catch (err) {
-    handleFirestoreError(err, OperationType.LIST, 'users');
+    }
+  } catch {
+    // Not found
   }
+  return null;
 }
 
-export async function listDiscoverableUsers(myUid: string): Promise<UserProfile[]> {
+export async function addUserToContacts(
+  myUid: string,
+  user: UserProfile,
+  aliasName?: string
+) {
+  const finalAlias = (aliasName || user.displayName || user.username).trim().slice(0, 80);
   try {
-    const q = query(collection(db, 'users'), where('uid', '>=', ''), where('uid', '<=', '\uf8ff'), limit(30));
-    const snaps = await getDocs(q);
-    const results: UserProfile[] = [];
-    snaps.forEach((d) => {
-      const u = d.data() as UserProfile;
-      if (u.uid !== myUid) results.push(u);
+    await setDoc(doc(db, 'users', myUid, 'contacts', user.uid), {
+      ownerUid: myUid,
+      contactUid: user.uid,
+      aliasName: finalAlias,
+      username: user.username,
+      displayName: user.displayName,
+      photoURL: user.photoURL || '',
+      addedAt: serverTimestamp(),
     });
-    return results;
   } catch (err) {
-    handleFirestoreError(err, OperationType.LIST, 'users');
+    handleFirestoreError(err, OperationType.CREATE, `users/${myUid}/contacts/${user.uid}`);
   }
 }
 
@@ -426,6 +451,45 @@ export async function getOrCreatePrivateConversation(
       await setDoc(doc(db, 'conversations', convId, 'members', peerProfile.uid), {
         convId,
         uid: peerProfile.uid,
+        role: 'admin',
+        pinned: false,
+        archived: false,
+        mutedUntil: 0,
+        unreadCount: 0,
+        joinedAt: serverTimestamp(),
+      });
+    }
+    return convId;
+  } catch (err) {
+    handleFirestoreError(err, OperationType.WRITE, `conversations/${convId}`);
+  }
+}
+
+export async function getOrCreateSavedMessagesConversation(myProfile: UserProfile): Promise<string> {
+  const convId = `self_${myProfile.uid}`;
+  const convRef = doc(db, 'conversations', convId);
+  try {
+    const snap = await getDoc(convRef);
+    if (!snap.exists()) {
+      await setDoc(convRef, {
+        id: convId,
+        type: 'private',
+        title: 'Catatan Tersimpan',
+        memberUids: [myProfile.uid],
+        adminUids: [myProfile.uid],
+        createdBy: myProfile.uid,
+        disappearingSeconds: 0,
+        onlyAdminsCanSend: false,
+        onlyAdminsCanEditInfo: false,
+        lastMessageText: '',
+        lastMessageType: 'text',
+        lastMessageSenderUid: '',
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+      await setDoc(doc(db, 'conversations', convId, 'members', myProfile.uid), {
+        convId,
+        uid: myProfile.uid,
         role: 'admin',
         pinned: false,
         archived: false,

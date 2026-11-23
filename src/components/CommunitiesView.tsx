@@ -13,6 +13,7 @@ import {
 } from 'firebase/firestore';
 import {
   Check,
+  Edit3,
   Globe,
   MessageSquare,
   Plus,
@@ -24,9 +25,10 @@ import {
 } from 'lucide-react';
 import { db, handleFirestoreError, OperationType } from '../lib/firebase';
 import {
+  addUserToContacts,
   createGroupConversation,
+  findUserExactForAdd,
   getOrCreatePrivateConversation,
-  searchUsersByQuery,
   uploadMediaFile,
 } from '../lib/chatService';
 import type { Contact, Conversation, UserProfile } from '../types/chat';
@@ -48,9 +50,12 @@ export const CommunitiesView: React.FC<CommunitiesViewProps> = ({
 }) => {
   const { showToast } = useToast();
   const [searchTerm, setSearchTerm] = useState('');
-  const [searchResults, setSearchResults] = useState<UserProfile[]>([]);
+  const [foundUser, setFoundUser] = useState<UserProfile | null>(null);
+  const [searchAttempted, setSearchAttempted] = useState(false);
   const [searching, setSearching] = useState(false);
   const [publicGroups, setPublicGroups] = useState<Conversation[]>([]);
+  const [editingAliasUid, setEditingAliasUid] = useState<string | null>(null);
+  const [aliasDraft, setAliasDraft] = useState('');
 
   const [showCreateGroup, setShowCreateGroup] = useState(false);
   const [groupTitle, setGroupTitle] = useState('');
@@ -82,11 +87,12 @@ export const CommunitiesView: React.FC<CommunitiesViewProps> = ({
     e.preventDefault();
     if (!searchTerm.trim()) return;
     setSearching(true);
+    setSearchAttempted(true);
     try {
-      const users = await searchUsersByQuery(searchTerm, myProfile.uid);
-      setSearchResults(users);
-      if (users.length === 0) {
-        showToast('Pengguna tidak ditemukan. Pastikan username atau nomor HP benar.', 'info');
+      const user = await findUserExactForAdd(searchTerm, myProfile.uid);
+      setFoundUser(user);
+      if (!user) {
+        showToast('Pengguna tidak ditemukan. Pastikan @username lengkap atau nomor HP persis benar.', 'info');
       }
     } catch {
       showToast('Gagal mencari pengguna', 'error');
@@ -97,18 +103,24 @@ export const CommunitiesView: React.FC<CommunitiesViewProps> = ({
 
   const handleAddContact = async (user: UserProfile) => {
     try {
-      await setDoc(doc(db, 'users', myProfile.uid, 'contacts', user.uid), {
-        ownerUid: myProfile.uid,
-        contactUid: user.uid,
-        aliasName: user.displayName,
-        username: user.username,
-        displayName: user.displayName,
-        photoURL: user.photoURL || '',
-        addedAt: serverTimestamp(),
-      });
+      await addUserToContacts(myProfile.uid, user);
       showToast(`${user.displayName} ditambahkan ke kontak`, 'success');
     } catch {
       showToast('Gagal menambahkan kontak', 'error');
+    }
+  };
+
+  const handleSaveAlias = async (contact: Contact) => {
+    const nextAlias = aliasDraft.trim().slice(0, 80);
+    if (!nextAlias) return;
+    try {
+      await updateDoc(doc(db, 'users', myProfile.uid, 'contacts', contact.contactUid), {
+        aliasName: nextAlias,
+      });
+      setEditingAliasUid(null);
+      showToast('Nama panggilan kontak diperbarui', 'success');
+    } catch {
+      showToast('Gagal mengubah nama kontak', 'error');
     }
   };
 
@@ -249,19 +261,25 @@ export const CommunitiesView: React.FC<CommunitiesViewProps> = ({
       </div>
 
       <div className="p-4 sm:p-6 space-y-8">
-        {/* Cari Pengguna */}
+        {/* Tambah Kontak (Privasi Ketat: Harus Masukkan Username/HP Persis) */}
         <section>
-          <h3 className="text-xs font-semibold text-slate-500 dark:text-slate-400 mb-2.5">
-            Cari Pengguna (Username atau Nomor HP)
+          <h3 className="text-xs font-semibold text-slate-500 dark:text-slate-400 mb-1">
+            Tambah Kontak Baru (Username Lengkap atau Nomor HP)
           </h3>
+          <p className="text-[11px] text-slate-500 dark:text-slate-400 mb-2.5">
+            Demi privasi, daftar pengguna lain disembunyikan. Masukkan @username atau nomor HP yang persis untuk menambahkan kontak.
+          </p>
           <form onSubmit={handleSearch} className="flex gap-2">
             <div className="relative flex-1">
               <Search className="w-4 h-4 text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2" />
               <input
                 type="text"
                 value={searchTerm}
-                onChange={(e) => setSearchTerm(e.target.value)}
-                placeholder="Ketik @username atau 0812..."
+                onChange={(e) => {
+                  setSearchTerm(e.target.value);
+                  setSearchAttempted(false);
+                }}
+                placeholder="Ketik @username lengkap atau 0812..."
                 className="w-full pl-10 pr-4 py-2.5 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 text-sm text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-emerald-500"
               />
             </div>
@@ -274,39 +292,44 @@ export const CommunitiesView: React.FC<CommunitiesViewProps> = ({
             </button>
           </form>
 
-          {searchResults.length > 0 && (
-            <div className="mt-3 divide-y divide-slate-100 dark:divide-slate-800 rounded-2xl border border-slate-200 dark:border-slate-800">
-              {searchResults.map((u) => (
-                <div key={u.uid} className="flex items-center gap-3 p-3.5">
-                  <Avatar name={u.displayName} src={u.photoURL} size="md" online={u.isOnline} />
-                  <div className="flex-1 min-w-0">
-                    <div className="text-sm font-semibold text-slate-900 dark:text-white truncate">
-                      {u.displayName}
-                    </div>
-                    <div className="text-xs text-slate-500 dark:text-slate-400 truncate">
-                      @{u.username} {u.bio ? `· ${u.bio}` : ''}
-                    </div>
+          {searchAttempted && !searching && !foundUser && (
+            <div className="mt-3 rounded-2xl border border-slate-200 dark:border-slate-800 p-3.5 text-xs text-slate-500 dark:text-slate-400">
+              Pengguna dengan username atau nomor HP tersebut tidak ditemukan.
+            </div>
+          )}
+
+          {foundUser && (
+            <div className="mt-3 rounded-2xl border border-slate-200 dark:border-slate-800">
+              <div className="flex items-center gap-3 p-3.5">
+                <Avatar name={foundUser.displayName} src={foundUser.photoURL} size="md" online={foundUser.isOnline} />
+                <div className="flex-1 min-w-0">
+                  <div className="text-sm font-semibold text-slate-900 dark:text-white truncate">
+                    {foundUser.displayName}
                   </div>
-                  <div className="flex items-center gap-2">
-                    {!contactSet.has(u.uid) && (
-                      <button
-                        onClick={() => handleAddContact(u)}
-                        className="p-2 rounded-xl bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 text-slate-700 dark:text-slate-200"
-                        title="Tambahkan ke kontak"
-                      >
-                        <UserPlus className="w-4 h-4" />
-                      </button>
-                    )}
+                  <div className="text-xs text-slate-500 dark:text-slate-400 truncate">
+                    @{foundUser.username} {foundUser.bio ? `· ${foundUser.bio}` : ''}
+                  </div>
+                </div>
+                <div className="flex items-center gap-2">
+                  {!contactSet.has(foundUser.uid) ? (
                     <button
-                      onClick={() => handleStartPrivateChat(u)}
+                      onClick={() => handleAddContact(foundUser)}
+                      className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-semibold"
+                    >
+                      <UserPlus className="w-3.5 h-3.5" />
+                      Tambah Kontak
+                    </button>
+                  ) : (
+                    <button
+                      onClick={() => handleStartPrivateChat(foundUser)}
                       className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-semibold"
                     >
                       <MessageSquare className="w-3.5 h-3.5" />
                       Chat
                     </button>
-                  </div>
+                  )}
                 </div>
-              ))}
+              </div>
             </div>
           )}
         </section>
@@ -318,7 +341,7 @@ export const CommunitiesView: React.FC<CommunitiesViewProps> = ({
           </h3>
           {contacts.length === 0 ? (
             <div className="rounded-2xl border border-slate-200 dark:border-slate-800 p-6 text-center text-sm text-slate-500 dark:text-slate-400">
-              Belum ada kontak tersimpan. Cari pengguna di atas untuk menambahkan kontak baru.
+              Belum ada kontak tersimpan. Tambahkan teman lewat @username atau nomor HP di atas.
             </div>
           ) : (
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
@@ -329,11 +352,41 @@ export const CommunitiesView: React.FC<CommunitiesViewProps> = ({
                 >
                   <Avatar name={c.aliasName} src={c.photoURL} size="md" />
                   <div className="flex-1 min-w-0">
-                    <div className="text-sm font-semibold text-slate-900 dark:text-white truncate">
-                      {c.aliasName}
-                    </div>
+                    {editingAliasUid === c.contactUid ? (
+                      <div className="flex items-center gap-1.5">
+                        <input
+                          type="text"
+                          value={aliasDraft}
+                          onChange={(e) => setAliasDraft(e.target.value)}
+                          maxLength={80}
+                          className="w-full px-2 py-1 rounded-lg border border-emerald-500 bg-white dark:bg-slate-900 text-xs"
+                          autoFocus
+                        />
+                        <button
+                          onClick={() => handleSaveAlias(c)}
+                          className="p-1 rounded-lg bg-emerald-600 text-white"
+                          title="Simpan"
+                        >
+                          <Check className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
+                    ) : (
+                      <div className="text-sm font-semibold text-slate-900 dark:text-white truncate">
+                        {c.aliasName}
+                      </div>
+                    )}
                     <div className="text-xs text-slate-500 dark:text-slate-400">@{c.username}</div>
                   </div>
+                  <button
+                    onClick={() => {
+                      setEditingAliasUid(editingAliasUid === c.contactUid ? null : c.contactUid);
+                      setAliasDraft(c.aliasName);
+                    }}
+                    className="p-1.5 text-slate-400 hover:text-emerald-600"
+                    title="Ubah nama panggilan"
+                  >
+                    <Edit3 className="w-3.5 h-3.5" />
+                  </button>
                   <button
                     onClick={() =>
                       handleStartPrivateChat({

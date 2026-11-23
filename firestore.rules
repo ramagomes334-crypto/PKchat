@@ -319,7 +319,7 @@ service cloud.firestore {
     // 1. Public User Profiles (PII-free)
     match /users/{uid} {
       allow get: if isSignedIn() && isValidId(uid);
-      allow list: if isSignedIn() && resource.data.uid >= '' && resource.data.uid <= '\uf8ff';
+      allow list: if false;
       allow create: if isVerifiedUser() && isValidId(uid) && isOwner(uid) &&
         isValidUserProfile(incoming()) &&
         incoming().uid == uid &&
@@ -427,7 +427,7 @@ service cloud.firestore {
     // 2. Username Registry
     match /usernames/{username} {
       allow get: if isSignedIn() && isValidId(username);
-      allow list: if isSignedIn() && resource.data.username is string;
+      allow list: if false;
       allow create: if isVerifiedUser() && isValidId(username) &&
         isValidUsernameLookup(incoming()) &&
         incoming().username == username &&

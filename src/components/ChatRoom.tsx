@@ -258,9 +258,21 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
       .slice(0, 5);
   }, [mentionMatch?.[1], conv.memberUids, membersProfiles]);
 
+  const draftKey = `pk_chat_draft_${conv.id}`;
+
+  useEffect(() => {
+    try {
+      const saved = localStorage.getItem(draftKey);
+      setInputText(saved || '');
+    } catch {
+      setInputText('');
+    }
+  }, [conv.id]);
+
   const lastTypingEmitRef = useRef<number>(0);
 
   const emitTyping = (isTyping: boolean) => {
+    if (conv.id.startsWith('self_')) return;
     const now = Date.now();
     if (isTyping && now - lastTypingEmitRef.current < 1800) {
       return;
@@ -271,6 +283,15 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
 
   const handleInputChange = (val: string) => {
     setInputText(val);
+    try {
+      if (val) {
+        localStorage.setItem(draftKey, val);
+      } else {
+        localStorage.removeItem(draftKey);
+      }
+    } catch {
+      // Ignore storage quota errors
+    }
     emitTyping(val.length > 0);
     if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
     typingTimeoutRef.current = window.setTimeout(() => emitTyping(false), 2500);
@@ -287,6 +308,11 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
 
     emitTyping(false);
     setInputText('');
+    try {
+      localStorage.removeItem(draftKey);
+    } catch {
+      // Ignore
+    }
 
     if (editingMsg) {
       try {
@@ -565,13 +591,40 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
       ? 'text-base'
       : 'text-sm';
 
+  const isSelfChat = conv.id.startsWith('self_') || (conv.type === 'private' && conv.memberUids.length === 1);
   const typingNames = Object.values(typingUsers).filter(Boolean);
-  const chatTitle = isGroup ? conv.title || 'Grup PK Chat' : peerProfile?.displayName || 'Pengguna';
-  const chatAvatar = isGroup
+  const chatTitle = isSelfChat
+    ? 'Catatan Tersimpan'
+    : isGroup
+    ? conv.title || 'Grup PK Chat'
+    : peerProfile?.displayName || 'Pengguna';
+  const chatAvatar = isSelfChat
+    ? myProfile.photoURL
+    : isGroup
     ? conv.photoURL
     : peerProfile?.showProfilePhoto
     ? peerProfile?.photoURL
     : undefined;
+
+  const handleExportChat = () => {
+    const lines = visibleMessages.map((m) => {
+      const ts = m.createdAt?.toDate ? m.createdAt.toDate() : new Date();
+      const stamp = ts.toLocaleString('id-ID');
+      const body = m.deletedForAll
+        ? '[Pesan dihapus]'
+        : decryptedMap[m.id] || m.text || (m.mediaName ? `[${m.type}: ${m.mediaName}]` : `[${m.type}]`);
+      return `[${stamp}] ${m.senderName}: ${body}`;
+    });
+    const content = `PK Chat — ${chatTitle}\nDiekspor pada ${new Date().toLocaleString('id-ID')}\n\n${lines.join('\n')}`;
+    const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `pk-chat-${chatTitle.toLowerCase().replace(/[^a-z0-9]+/g, '-')}.txt`;
+    a.click();
+    URL.revokeObjectURL(url);
+    showToast('Riwayat chat diunduh (.txt)', 'success');
+  };
 
   return (
     <div className="flex-1 flex flex-col h-full min-w-0 bg-[#F4F7F5] dark:bg-[#0D1419]">
@@ -591,7 +644,7 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
               name={chatTitle}
               src={chatAvatar}
               size="sm"
-              online={!isGroup && isPeerOnline && peerProfile?.showOnlineStatus}
+              online={!isGroup && !isSelfChat && isPeerOnline && peerProfile?.showOnlineStatus}
               isGroup={isGroup}
             />
             <div className="min-w-0">
@@ -599,7 +652,9 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
                 {chatTitle}
               </div>
               <div className="text-[11px] text-slate-500 dark:text-slate-400 truncate">
-                {typingNames.length > 0 ? (
+                {isSelfChat ? (
+                  'Catatan & pesan tersimpan pribadi'
+                ) : typingNames.length > 0 ? (
                   <span className="text-emerald-600 dark:text-emerald-400 font-medium">
                     {isGroup ? `${typingNames[0]} sedang mengetik...` : 'sedang mengetik...'}
                   </span>
@@ -634,7 +689,7 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
           >
             <Search className="w-4 h-4" />
           </button>
-          {!isGroup && (
+          {!isGroup && !isSelfChat && (
             <>
               <button
                 onClick={() => onStartCall('audio')}
@@ -652,6 +707,14 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
               </button>
             </>
           )}
+          <button
+            onClick={handleExportChat}
+            className="hidden sm:flex min-w-[40px] min-h-[40px] rounded-xl items-center justify-center text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800"
+            aria-label="Ekspor riwayat chat (.txt)"
+            title="Ekspor riwayat chat (.txt)"
+          >
+            <Download className="w-4 h-4" />
+          </button>
           <button
             onClick={onToggleInfo}
             className="min-w-[40px] min-h-[40px] rounded-xl flex items-center justify-center text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800"
@@ -826,6 +889,12 @@ export const ChatRoom: React.FC<ChatRoomProps> = ({
 
                   <div className={`relative max-w-[82%] sm:max-w-[68%] flex flex-col ${isOwn ? 'items-end' : 'items-start'}`}>
                     <div
+                      onDoubleClick={() => {
+                        if (!m.deletedForAll && !selectMode) {
+                          setReplyTo(m);
+                        }
+                      }}
+                      title={!m.deletedForAll && !selectMode ? 'Klik ganda untuk membalas' : undefined}
                       className={`relative rounded-2xl px-3.5 py-2 shadow-xs ${
                         isOwn
                           ? 'bg-emerald-100/95 dark:bg-emerald-900/55 text-slate-900 dark:text-emerald-50 rounded-br-sm'

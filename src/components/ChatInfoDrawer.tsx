@@ -78,6 +78,7 @@ export const ChatInfoDrawer: React.FC<ChatInfoDrawerProps> = ({
   const [decryptedStarred, setDecryptedStarred] = useState<Record<string, string>>({});
 
   const isGroup = conv.type === 'group';
+  const isSelfChat = conv.id.startsWith('self_') || (conv.type === 'private' && conv.memberUids.length === 1);
   const isAdmin = conv.adminUids?.includes(myProfile.uid);
   const canEditGroupInfo = isGroup && (isAdmin || !conv.onlyAdminsCanEditInfo);
 
@@ -87,10 +88,10 @@ export const ChatInfoDrawer: React.FC<ChatInfoDrawerProps> = ({
   }, [conv.id, conv.title, conv.description]);
 
   useEffect(() => {
-    if (!isGroup && peerProfile) {
+    if (!isGroup && !isSelfChat && peerProfile) {
       computeSafetyCode(myProfile.e2eePublicKey, peerProfile.e2eePublicKey).then(setSafetyCode);
     }
-  }, [isGroup, myProfile.e2eePublicKey, peerProfile?.e2eePublicKey]);
+  }, [isGroup, isSelfChat, myProfile.e2eePublicKey, peerProfile?.e2eePublicKey]);
 
   const starredMessages = messages.filter((m) => m.starredByUids?.includes(myProfile.uid));
   const mediaMessages = messages.filter((m) => m.type === 'image' || m.type === 'video');
@@ -333,7 +334,7 @@ export const ChatInfoDrawer: React.FC<ChatInfoDrawerProps> = ({
     <aside className="w-full lg:w-[340px] shrink-0 border-l border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111820] flex flex-col h-full overflow-y-auto">
       <div className="h-14 px-4 border-b border-slate-200 dark:border-slate-800 flex items-center justify-between shrink-0">
         <h3 className="font-display text-sm font-bold text-slate-900 dark:text-white">
-          {isGroup ? 'Info Grup' : 'Info Kontak'}
+          {isSelfChat ? 'Info Catatan Tersimpan' : isGroup ? 'Info Grup' : 'Info Kontak'}
         </h3>
         <button
           onClick={onClose}
@@ -349,8 +350,8 @@ export const ChatInfoDrawer: React.FC<ChatInfoDrawerProps> = ({
         <div className="flex flex-col items-center text-center">
           <div className="relative">
             <Avatar
-              name={isGroup ? conv.title || 'Grup' : peerProfile?.displayName || 'Pengguna'}
-              src={isGroup ? conv.photoURL : peerProfile?.showProfilePhoto ? peerProfile?.photoURL : undefined}
+              name={isSelfChat ? 'Catatan Tersimpan' : isGroup ? conv.title || 'Grup' : peerProfile?.displayName || 'Pengguna'}
+              src={isSelfChat ? myProfile.photoURL : isGroup ? conv.photoURL : peerProfile?.showProfilePhoto ? peerProfile?.photoURL : undefined}
               size="xl"
               isGroup={isGroup}
             />
@@ -365,13 +366,21 @@ export const ChatInfoDrawer: React.FC<ChatInfoDrawerProps> = ({
           {!editingGroup ? (
             <>
               <h4 className="mt-3 font-display text-lg font-bold text-slate-900 dark:text-white">
-                {isGroup ? conv.title : peerProfile?.displayName}
+                {isSelfChat ? 'Catatan Tersimpan' : isGroup ? conv.title : peerProfile?.displayName}
               </h4>
               <p className="text-xs text-slate-500 dark:text-slate-400">
-                {isGroup ? `${conv.memberUids.length} anggota` : `@${peerProfile?.username || ''}`}
+                {isSelfChat
+                  ? 'Ruang catatan pribadi Anda'
+                  : isGroup
+                  ? `${conv.memberUids.length} anggota`
+                  : `@${peerProfile?.username || ''}`}
               </p>
               <p className="mt-2 text-xs text-slate-600 dark:text-slate-300 leading-relaxed">
-                {isGroup ? conv.description || 'Belum ada deskripsi grup.' : peerProfile?.bio || 'Tersedia di PK Chat'}
+                {isSelfChat
+                  ? 'Simpan teks, tautan, foto, dan dokumen pribadi secara aman hanya untuk Anda.'
+                  : isGroup
+                  ? conv.description || 'Belum ada deskripsi grup.'
+                  : peerProfile?.bio || 'Tersedia di PK Chat'}
               </p>
               {canEditGroupInfo && (
                 <button

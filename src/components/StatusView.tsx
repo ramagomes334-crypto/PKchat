@@ -182,9 +182,8 @@ export const StatusView: React.FC<StatusViewProps> = ({
     }
   };
 
-  const handleReplyStatus = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!viewingStatus || !replyText.trim()) return;
+  const sendStatusReply = async (messageText: string) => {
+    if (!viewingStatus || !messageText.trim()) return;
     try {
       const peerProfile: UserProfile = {
         uid: viewingStatus.authorUid,
@@ -211,7 +210,7 @@ export const StatusView: React.FC<StatusViewProps> = ({
         sender: myProfile,
         peerProfile,
         type: 'text',
-        text: `Membalas status "${viewingStatus.caption || viewingStatus.type}": ${replyText.trim()}`,
+        text: `Membalas status "${viewingStatus.caption || viewingStatus.type}": ${messageText.trim()}`,
       });
       setReplyText('');
       setPlaylist([]);
@@ -220,6 +219,11 @@ export const StatusView: React.FC<StatusViewProps> = ({
     } catch {
       showToast('Gagal mengirim balasan status', 'error');
     }
+  };
+
+  const handleReplyStatus = async (e: React.FormEvent) => {
+    e.preventDefault();
+    await sendStatusReply(replyText);
   };
 
   const formatRemaining = (expiresAt: number) => {
@@ -639,22 +643,37 @@ export const StatusView: React.FC<StatusViewProps> = ({
                 )}
               </div>
             ) : (
-              <form onSubmit={handleReplyStatus} className="flex items-center gap-2">
-                <input
-                  type="text"
-                  value={replyText}
-                  onChange={(e) => setReplyText(e.target.value)}
-                  placeholder={`Balas status ${viewingStatus.authorName}...`}
-                  className="flex-1 px-4 py-2.5 rounded-xl bg-white/10 border border-white/15 text-sm text-white placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-emerald-500"
-                />
-                <button
-                  type="submit"
-                  className="p-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white"
-                  aria-label="Kirim balasan"
-                >
-                  <Send className="w-4 h-4" />
-                </button>
-              </form>
+              <div className="space-y-2">
+                <div className="flex items-center justify-center gap-2">
+                  {['🔥', '❤️', '😂', '👏', '😮'].map((em) => (
+                    <button
+                      key={em}
+                      type="button"
+                      onClick={() => sendStatusReply(em)}
+                      className="w-9 h-9 rounded-full bg-white/10 hover:bg-white/20 text-lg flex items-center justify-center transition-transform hover:scale-110"
+                      aria-label={`Reaksi ${em}`}
+                    >
+                      {em}
+                    </button>
+                  ))}
+                </div>
+                <form onSubmit={handleReplyStatus} className="flex items-center gap-2">
+                  <input
+                    type="text"
+                    value={replyText}
+                    onChange={(e) => setReplyText(e.target.value)}
+                    placeholder={`Balas status ${viewingStatus.authorName}...`}
+                    className="flex-1 px-4 py-2.5 rounded-xl bg-white/10 border border-white/15 text-sm text-white placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-emerald-500"
+                  />
+                  <button
+                    type="submit"
+                    className="p-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white"
+                    aria-label="Kirim balasan"
+                  >
+                    <Send className="w-4 h-4" />
+                  </button>
+                </form>
+              </div>
             )}
           </div>
         </div>
